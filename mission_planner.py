@@ -267,45 +267,15 @@ GIMBAL_PRESETS = {
         'note': 'A 5-10° tilt off nadir breaks the near-parallel imaging geometry that '
                 'causes "doming" — a well-documented systematic vertical error in pure-nadir '
                 'DEMs (James & Robson, 2014, Earth Surface Processes and Landforms). Pair '
-                'with Crosshatch for a proper convergent network. The same technique doubles '
-                'as micro-relief survey for archaeological earthworks, where SfM photogrammetry '
-                'has replaced laser scanning as the affordable option (Verhoeven, 2012) — '
-                'ground control points, placed under Site markup, are what get this into the '
-                '0.02-0.15m accuracy range the published results report.',
-    },
-    'archaeo_marks': {
-        'label': 'Archaeological survey — shadow & crop/soil marks', 'pitch': -90, 'overlap': (75, 65),
-        'note': 'Straight-down, same geometry as flat mapping — the technique lives in *when* '
-                'you fly, not the gimbal angle. Shadow marks (subtle earthworks like ridge-and-'
-                'furrow or hillforts) need raking light, so fly within an hour or two of sunrise '
-                'or sunset, not midday. Crop and soil marks come from buried features changing '
-                'how plants grow above them, and are only visible during specific windows — '
-                'literature on Mediterranean sites finds spring cereal fields most reliable, and '
-                'drought/moisture-stress periods sharpen the effect since stressed vegetation '
-                'shows differential growth more clearly. A consumer RGB drone can\'t capture true '
-                'NDVI, but the ExG/VARI/GLI visible-light indices (see Vegetation preset) are the '
-                'established substitute in published cropmark studies. Marks are transient — a '
-                'single flight can miss them entirely, so repeat surveys across a season (Save/'
-                'Load the same project) matter more here than for most other capture purposes.',
-    },
-    'excavation': {
-        'label': 'Excavation trench recording (close-range, repeat)', 'pitch': -75, 'overlap': (85, 80),
-        'note': 'Very close-range, high-overlap SfM to document an open trench in 3D — the '
-                'digital-archaeology equivalent of daily hand-drawn section drawings. Projects '
-                'like the Zagora excavations fly this literally every day the trench is open, '
-                'building a stratigraphic time series ("4D archaeology") instead of a single '
-                'snapshot; Save the project each day under a dated name and re-fly the same '
-                'path as the trench deepens. Higher overlap than standard mapping (85/80) '
-                'because close-range reconstruction needs a denser network than wide-area '
-                'coverage does. Fly low and slow, and add oblique passes by hand in Manual mode '
-                'for the trench walls, since a single nadir pass won\'t reconstruct vertical '
-                'sections.',
+                'with Crosshatch for a proper convergent network, and place ground control '
+                'points under Site markup for survey-grade accuracy.',
     },
     '3d_model': {
-        'label': '3D model / building / urban scene', 'pitch': -45, 'overlap': (80, 70),
+        'label': '3D model / building / urban scene', 'pitch': -45, 'overlap': (80, 70), 'threeD': True,
         'note': "Matches DJI Terra's own default oblique tilt (-45°) for 3D reconstruction "
-                'missions. Best flown as a nadir + oblique double-grid — enable "3D mapping '
-                '(nadir + oblique)" below to generate both passes in one mission automatically.',
+                'missions. Turns on "3D mapping (nadir + oblique)" automatically — a single '
+                'oblique pass never images vertical surfaces like walls, so this flies the area '
+                'twice, once nadir and once oblique, to actually get both.',
     },
     'facade': {
         'label': 'Building facade / vertical structure inspection', 'pitch': -50, 'overlap': (80, 70),
@@ -2008,6 +1978,14 @@ function setGimbalPreset(k){
   if(g && k!=='custom'){
     cfg.gimbalPitch=g.pitch;
     if(g.overlap){ cfg.forwardOverlap=g.overlap[0]; cfg.sideOverlap=g.overlap[1]; }
+    // A preset fully determines whether this is a 3D-mapping (nadir+oblique)
+    // capture or not -- otherwise switching presets can leave 3D mapping
+    // silently on (or off) from whatever was picked before, and the "Gimbal
+    // pitch" field above would be setting a value the generator ignores once
+    // 3D mapping is active (it hardcodes nadir to -90 and uses the separate
+    // "Oblique pass gimbal pitch" field instead).
+    cfg.threeDMapping = !!g.threeD;
+    if(g.threeD) cfg.obliqueGimbal = g.pitch;
   }
   refreshEstimate(); renderSetup();
 }
@@ -2093,7 +2071,8 @@ function renderSetup(){
     '<div class="field"><label>What are you capturing?</label><select onchange="setGimbalPreset(this.value)">'+gimbalOptions()+'</select></div>' +
     (gimbalNote ? '<div class="hint">'+gimbalNote+'</div>' : '') +
     '<div class="field" style="margin-top:8px;"><label>Gimbal pitch <span style="float:right;color:var(--text-faint);">-90&deg;=down &middot; 0&deg;=horizon</span></label>' +
-      '<input type="number" value="'+cfg.gimbalPitch+'" onchange="cfg.gimbalPitch=parseFloat(this.value)||0;cfg.gimbalPreset=\'custom\';refreshEstimate()"></div>' +
+      '<input type="number" value="'+cfg.gimbalPitch+'" '+(cfg.threeDMapping?'disabled':'')+' onchange="cfg.gimbalPitch=parseFloat(this.value)||0;cfg.gimbalPreset=\'custom\';refreshEstimate()"></div>' +
+    (cfg.threeDMapping ? '<div class="hint">3D mapping is on, so this is unused &mdash; the nadir pass is fixed at -90&deg; and the oblique pass uses "Oblique pass gimbal pitch" under Grid survey settings below.</div>' : '') +
     '</div>' +
 
     // ── Per-mission-type settings, collapsed except the currently relevant one ──
@@ -2118,9 +2097,11 @@ function renderSetup(){
         opt('toPointAndPassWithContinuityCurvature',cfg.turnMode,'Smooth flythrough, never stops')+
       '</select></div>' +
       '<div class="hint">Stopping at each point keeps camera position/GSD consistent for photogrammetry — the standard choice for mapping. Smooth flythrough covers ground faster but can blur shots taken mid-turn.</div>' +
-      '<div class="checkbox-row" style="margin-top:8px;"><input type="checkbox" id="cb-xh" '+(cfg.crosshatch?'checked':'')+' onchange="cfg.crosshatch=this.checked;refreshEstimate()"><label for="cb-xh">Crosshatch (double grid) for thorough coverage</label></div>' +
-      '<div class="hint">Second pass at 90° to the first. Roughly doubles photo count and flight time but fills gaps a single sweep misses on irregular sites.</div>' +
-      '<div class="checkbox-row" style="margin-top:8px;"><input type="checkbox" id="cb-3d" '+(cfg.threeDMapping?'checked':'')+' onchange="cfg.threeDMapping=this.checked;refreshEstimate();renderSetup()"><label for="cb-3d">3D mapping (nadir + oblique double-grid)</label></div>' +
+      '<div class="checkbox-row" style="margin-top:8px;'+(cfg.threeDMapping?'opacity:.4;':'')+'"><input type="checkbox" id="cb-xh" '+(cfg.crosshatch?'checked':'')+(cfg.threeDMapping?' disabled':'')+' onchange="cfg.crosshatch=this.checked;refreshEstimate()"><label for="cb-xh">Crosshatch (double grid) for thorough coverage</label></div>' +
+      (cfg.threeDMapping ?
+        '<div class="hint">Superseded by 3D mapping below, which already flies two full passes — crosshatch is ignored while it\'s on.</div>' :
+        '<div class="hint">Second pass at 90° to the first. Roughly doubles photo count and flight time but fills gaps a single sweep misses on irregular sites.</div>') +
+      '<div class="checkbox-row" style="margin-top:8px;"><input type="checkbox" id="cb-3d" '+(cfg.threeDMapping?'checked':'')+' onchange="cfg.threeDMapping=this.checked;if(this.checked)cfg.crosshatch=false;refreshEstimate();renderSetup()"><label for="cb-3d">3D mapping (nadir + oblique double-grid)</label></div>' +
       '<div class="hint">Flies the area twice: once straight down, once tilted (rotated 90° from the first pass) — the method DJI Terra/Pix4D document for full 3D reconstruction, since a pure-nadir pass never images vertical surfaces like walls. Roughly doubles photo count.</div>' +
       (cfg.threeDMapping ?
         '<div class="field" style="margin-top:8px;"><label>Oblique pass gimbal pitch</label><input type="number" value="'+cfg.obliqueGimbal+'" onchange="cfg.obliqueGimbal=parseFloat(this.value)||-45;refreshEstimate()"></div>' : '') +
