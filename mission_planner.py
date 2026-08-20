@@ -811,8 +811,11 @@ def export_wpml_kmz(cfg, waypoints, out_path):
 #
 # DJI Fly only ever loads a mission it created itself, so the trick (same one
 # DJI-KMZ-Injector's own ADB backend uses) is: a dummy mission already exists on
-# the controller as a UUID-named folder containing "<uuid>.kmz"; find the newest
-# one and overwrite that file in place.
+# the controller as a UUID-named folder containing "<uuid>.kmz". Rather than
+# guessing which one to overwrite, list_mission_slots() surfaces all of them —
+# with waypoint count and approximate location read from each mission file, since
+# DJI Fly's own mission title isn't stored anywhere MTP can reach — and the user
+# picks which slot upload_kmz_to_slot() replaces.
 
 WAYPOINT_MTP_PATH = ['Internal shared storage', 'Android', 'data', 'dji.go.v5', 'files', 'waypoint']
 _UUID_RE = re.compile(r'^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$')
@@ -858,24 +861,58 @@ def find_waypoint_folder(shell, device_name_hint):
         trail.append(step)
     return folder
 
-def find_latest_mission_uuid(waypoint_folder):
-    missions = []
-    for item in waypoint_folder.Items():
-        if _UUID_RE.match(item.Name):
-            try:
-                mod = item.ModifyDate
-            except Exception:
-                mod = ''
-            missions.append((item.Name, mod))
-    if not missions:
-        raise RuntimeError(
-            'No mission folders under waypoint/. Create a throwaway waypoint mission '
-            'in DJI Fly on the controller first, then try again.'
-        )
-    missions.sort(key=lambda m: m[1], reverse=True)
-    return missions[0][0]
+def _copy_from_mtp(shell, mtp_item, dest_dir):
+    dest_folder = shell.NameSpace(dest_dir)
+    if dest_folder is None:
+        raise RuntimeError(f'Could not open local temp folder {dest_dir}')
+    FOF_SILENT, FOF_NOCONFIRMATION, FOF_NOERRORUI = 4, 16, 512
+    dest_folder.CopyHere(mtp_item, FOF_SILENT | FOF_NOCONFIRMATION | FOF_NOERRORUI)
 
-def upload_kmz_via_mtp(local_kmz_path, device_name_hint='DJI', progress=None):
+def _peek_mission_kmz(local_kmz_path):
+    """Waypoint count, an approximate center point, and (if present — DJI Fly itself
+    doesn't set one) a KML <name> tag, read from a mission file already on the
+    controller. Only used to help identify a mission slot in the upload picker."""
+    try:
+        with zipfile.ZipFile(local_kmz_path) as z:
+            names = z.namelist()
+            xml_name = (next((n for n in names if n.lower().endswith('waylines.wpml')), None)
+                        or next((n for n in names if n.lower().endswith('template.kml')), None))
+            if not xml_name:
+                return {'waypoints': None, 'lat': None, 'lon': None, 'name': None}
+            root = ET.fromstring(z.read(xml_name).decode('utf-8', errors='replace'))
+    except Exception:
+        return {'waypoints': None, 'lat': None, 'lon': None, 'name': None}
+
+    lats, lons, count = [], [], 0
+    for pm in root.iter():
+        if _local(pm.tag) != 'Placemark':
+            continue
+        for c in pm.iter():
+            if _local(c.tag) == 'coordinates' and c.text:
+                parts = c.text.strip().split(',')
+                if len(parts) >= 2:
+                    try:
+                        lons.append(float(parts[0]))
+                        lats.append(float(parts[1]))
+                        count += 1
+                    except ValueError:
+                        pass
+                break
+    name = next((el.text.strip() for el in root.iter()
+                 if _local(el.tag) == 'name' and el.text and el.text.strip()), None)
+    return {
+        'waypoints': count or None,
+        'lat': round(sum(lats) / len(lats), 5) if lats else None,
+        'lon': round(sum(lons) / len(lons), 5) if lons else None,
+        'name': name,
+    }
+
+def list_mission_slots(device_name_hint='DJI', progress=None):
+    """Every UUID-named mission folder on the controller, each with the real
+    identifying info actually available: modified time, plus waypoint count and
+    an approximate center read from the mission file itself. No fabricated names —
+    DJI Fly's own mission title isn't exposed anywhere MTP can reach (see the
+    module comment above), so this shows what's real instead of guessing."""
     def report(msg):
         if progress:
             progress(msg)
@@ -887,20 +924,76 @@ def upload_kmz_via_mtp(local_kmz_path, device_name_hint='DJI', progress=None):
     shell = _shell_app()
     report('Looking for the controller...')
     waypoint_folder = find_waypoint_folder(shell, device_name_hint)
-    report('Finding the newest mission slot...')
-    uuid = find_latest_mission_uuid(waypoint_folder)
-    mission_folder, _ = _descend(shell, waypoint_folder, uuid)
+
+    slots = []
+    for item in waypoint_folder.Items():
+        if _UUID_RE.match(item.Name):
+            try:
+                mod = item.ModifyDate
+            except Exception:
+                mod = ''
+            slots.append((item.Name, mod))
+    if not slots:
+        raise RuntimeError(
+            'No mission folders under waypoint/. Create a throwaway waypoint mission '
+            'in DJI Fly on the controller first, then try again.'
+        )
+    slots.sort(key=lambda m: m[1], reverse=True)
+
+    report(f'Reading {len(slots)} mission slot(s)...')
+    tmp_dir = tempfile.mkdtemp(prefix='dmp_peek_')
+    results = []
+    try:
+        for uuid, mod in slots[:50]:
+            report(f'  reading {uuid}...')
+            entry = {'uuid': uuid, 'modified': str(mod), 'waypoints': None,
+                     'lat': None, 'lon': None, 'name': None}
+            mission_folder, _ = _descend(shell, waypoint_folder, uuid)
+            kmz_item = mission_folder.ParseName(f'{uuid}.kmz') if mission_folder else None
+            if kmz_item is not None:
+                try:
+                    _copy_from_mtp(shell, kmz_item, tmp_dir)
+                    local_path = os.path.join(tmp_dir, f'{uuid}.kmz')
+                    for _ in range(20):
+                        if os.path.exists(local_path):
+                            break
+                        time.sleep(0.1)
+                    if os.path.exists(local_path):
+                        entry.update(_peek_mission_kmz(local_path))
+                        os.remove(local_path)
+                except Exception:
+                    pass  # this slot just shows without waypoint/location details
+            results.append(entry)
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+    return results
+
+def upload_kmz_to_slot(local_kmz_path, target_uuid, device_name_hint='DJI', progress=None):
+    def report(msg):
+        if progress:
+            progress(msg)
+    try:
+        import win32com.client  # noqa: F401
+    except ImportError:
+        raise RuntimeError('pywin32 is required for this — install with: pip install pywin32')
+    if not _UUID_RE.match(target_uuid or ''):
+        raise RuntimeError('Invalid mission slot.')
+
+    shell = _shell_app()
+    report('Looking for the controller...')
+    waypoint_folder = find_waypoint_folder(shell, device_name_hint)
+    mission_folder, _ = _descend(shell, waypoint_folder, target_uuid)
     if mission_folder is None:
-        raise RuntimeError(f'Mission folder {uuid} disappeared mid-operation.')
+        raise RuntimeError(f'Mission slot {target_uuid} is no longer on the controller.')
 
     tmp_dir = tempfile.mkdtemp(prefix='dmp_mtp_')
     try:
-        tmp_path = os.path.join(tmp_dir, f'{uuid}.kmz')
+        tmp_path = os.path.join(tmp_dir, f'{target_uuid}.kmz')
         shutil.copy(local_kmz_path, tmp_path)
 
-        report(f'Removing the old mission file ({uuid}.kmz)...')
+        report(f'Removing the old mission file ({target_uuid}.kmz)...')
         try:
-            existing = mission_folder.ParseName(f'{uuid}.kmz')
+            existing = mission_folder.ParseName(f'{target_uuid}.kmz')
             if existing is not None:
                 existing.InvokeVerb('delete')
                 time.sleep(0.5)
@@ -915,13 +1008,13 @@ def upload_kmz_via_mtp(local_kmz_path, device_name_hint='DJI', progress=None):
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
     report('Verifying...')
-    found = any(item.Name.lower() == f'{uuid}.kmz'.lower() for item in mission_folder.Items())
+    found = any(item.Name.lower() == f'{target_uuid}.kmz'.lower() for item in mission_folder.Items())
     if not found:
         raise RuntimeError(
             'Upload finished but the file was not found afterward — the MTP copy may '
             'have silently failed. Check the mission on the controller before flying.'
         )
-    return uuid
+    return target_uuid
 
 # ── Python API exposed to JS ─────────────────────────────────────────────────
 
@@ -1063,18 +1156,44 @@ class Api:
         except Exception as e:
             return {'ok': False, 'msg': str(e)}
 
-    def upload_to_rc(self, cfg, waypoints, device_hint='DJI'):
+    def _live_log(self, msg, is_err=False):
+        """Push a log line to the picker's terminal-style panel as it happens,
+        instead of only returning the full log once the call finishes — useful
+        for both the user (proof it isn't hung) and for diagnosing exactly which
+        step failed on a flaky MTP connection."""
+        try:
+            self._window.evaluate_js(f'appendUploadLog({json.dumps(msg)}, {json.dumps(bool(is_err))})')
+        except Exception:
+            pass  # log streaming is best-effort; the final response still carries it all
+
+    def list_rc_missions(self, device_hint='DJI'):
+        log = []
+        def report(msg):
+            log.append(msg)
+            self._live_log(msg)
+        try:
+            slots = list_mission_slots(device_hint or 'DJI', progress=report)
+            return {'ok': True, 'slots': slots, 'log': log}
+        except Exception as e:
+            self._live_log(str(e), is_err=True)
+            return {'ok': False, 'msg': str(e), 'log': log}
+
+    def upload_to_rc_slot(self, cfg, waypoints, target_uuid, device_hint='DJI'):
         if not waypoints:
             return {'ok': False, 'msg': 'No waypoints to upload', 'log': []}
         log = []
+        def report(msg):
+            log.append(msg)
+            self._live_log(msg)
         tmp_dir = tempfile.mkdtemp(prefix='dmp_upload_')
         try:
             tmp_kmz = os.path.join(tmp_dir, 'mission.kmz')
             export_wpml_kmz(cfg, waypoints, tmp_kmz)
-            uuid = upload_kmz_via_mtp(tmp_kmz, device_hint or 'DJI', progress=log.append)
+            uuid = upload_kmz_to_slot(tmp_kmz, target_uuid, device_hint or 'DJI', progress=report)
             return {'ok': True, 'msg': f'Uploaded — open the mission on the controller '
                                         f'(slot {uuid}) in DJI Fly.', 'log': log}
         except Exception as e:
+            self._live_log(str(e), is_err=True)
             return {'ok': False, 'msg': str(e), 'log': log}
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
@@ -1300,6 +1419,29 @@ details .details-body{padding:2px 10px 10px;}
 #progress-overlay.visible{display:flex;}
 #progress-msg{color:#ccc;font-size:12px;}
 
+#picker-overlay{position:fixed;inset:0;background:#000a;z-index:9998;display:none;
+  align-items:center;justify-content:center;backdrop-filter:blur(2px);}
+#picker-overlay.visible{display:flex;}
+#picker-panel{width:560px;max-width:92vw;max-height:80vh;display:flex;flex-direction:column;
+  background:var(--bg2);border:1px solid var(--orange-dim);border-radius:var(--radius);
+  box-shadow:0 12px 40px #000a;}
+#picker-panel h3{padding:14px 16px;font-size:13px;color:var(--orange);border-bottom:1px solid var(--border);
+  display:flex;align-items:center;justify-content:space-between;}
+#picker-panel h3 span.close{cursor:pointer;color:var(--text-dim);font-weight:normal;font-size:16px;}
+#picker-log{background:#000;color:#3fda4f;font-family:Consolas,'Courier New',monospace;font-size:11px;
+  line-height:1.6;padding:10px 14px;max-height:160px;overflow-y:auto;border-bottom:1px solid var(--border);
+  display:none;white-space:pre-wrap;}
+#picker-log.visible{display:block;}
+#picker-log .err{color:#ff5c5c;}
+#picker-list{overflow-y:auto;padding:10px 16px;flex:1;}
+.slot-row{background:var(--bg3);border:1px solid var(--border);border-radius:var(--radius-sm);
+  padding:9px 11px;margin-bottom:8px;display:flex;align-items:center;gap:10px;}
+.slot-row:last-child{margin-bottom:0;}
+.slot-info{flex:1;font-size:11.5px;line-height:1.6;}
+.slot-info .uuid{color:var(--text-faint);font-size:10px;font-family:Consolas,monospace;}
+.slot-info .meta b{color:var(--orange);}
+#picker-footer{padding:10px 16px;border-top:1px solid var(--border);font-size:10.5px;color:var(--text-dim);}
+
 ::-webkit-scrollbar{width:7px;height:7px;}
 ::-webkit-scrollbar-track{background:transparent;}
 ::-webkit-scrollbar-thumb{background:var(--border2);border-radius:4px;}
@@ -1333,7 +1475,7 @@ details .details-body{padding:2px 10px 10px;}
     <button onclick="clearMission()">&#128465; Clear</button>
     <button class="primary" onclick="exportWpml()">&#128190; Export WPML</button>
     <button onclick="exportWpmlSplit()" title="Split into multiple missions sized to your battery's usable endurance">&#128267; Export by Battery</button>
-    <button onclick="uploadToRc()" title="Push straight to a connected DJI RC/RC2 over MTP — no manual file juggling">&#128225; Upload to RC</button>
+    <button onclick="openUploadPicker()" title="Pick a mission slot on a connected DJI RC/RC2 to replace, over MTP">&#128225; Upload to RC</button>
   </div>
   <div class="sep"></div>
   <div class="tgroup">
@@ -1344,6 +1486,15 @@ details .details-body{padding:2px 10px 10px;}
 </div>
 
 <div id="progress-overlay"><div id="progress-msg">Loading...</div></div>
+
+<div id="picker-overlay">
+  <div id="picker-panel">
+    <h3>Upload to RC <span class="close" onclick="closeUploadPicker()">&times;</span></h3>
+    <div id="picker-log"></div>
+    <div id="picker-list"></div>
+    <div id="picker-footer">Pick which mission slot on the controller gets replaced. Nothing else on the controller is touched.</div>
+  </div>
+</div>
 
 <div id="main">
   <div id="sidebar">
@@ -2309,19 +2460,65 @@ function exportWpmlSplit(){
     if(!res.ok && res.msg!=='Cancelled') alert(res.msg);
   });
 }
-function uploadToRc(){
+// ── Upload to RC — slot picker + live terminal-style log ────────────────────
+// The log lines shown here come live from Python via evaluate_js as each step
+// happens (device lookup, per-slot reads, delete, copy, verify) — not just a
+// summary dumped at the end. Useful for the user to see it isn't just hung, and
+// for diagnosing exactly which step failed on a flaky MTP connection.
+function appendUploadLog(msg, isErr){
+  var log = document.getElementById('picker-log');
+  log.classList.add('visible');
+  var line = document.createElement('div');
+  if(isErr) line.className='err';
+  line.textContent = '> ' + msg;
+  log.appendChild(line);
+  log.scrollTop = log.scrollHeight;
+}
+function openUploadPicker(){
   if(waypoints.length===0){ alert('No waypoints in the current mission.'); return; }
-  showProgress('Connecting to the controller over MTP...');
-  pywebview.api.upload_to_rc(cfg, waypoints).then(function(res){
-    hideProgress();
-    setStatus(res.msg);
+  document.getElementById('picker-overlay').classList.add('visible');
+  document.getElementById('picker-log').innerHTML=''; document.getElementById('picker-log').classList.remove('visible');
+  document.getElementById('picker-list').innerHTML='<div class="empty-hint">Scanning the controller...</div>';
+  pywebview.api.list_rc_missions().then(function(res){
     if(!res.ok){
-      var steps = (res.log && res.log.length) ? '\n\nSteps completed before the failure:\n- '+res.log.join('\n- ') : '';
-      alert('Upload failed: '+res.msg+steps+
-        '\n\nADB does not work on the RC2 (deliberately blocked in firmware) — this only '+
-        'uses MTP. If it keeps failing, fall back to the manual method in the README '+
-        '(rename the exported KMZ to match the newest mission folder\'s UUID and copy it '+
-        'in via Explorer).');
+      document.getElementById('picker-list').innerHTML =
+        '<div class="empty-hint">Could not read the controller:<br><b style="color:var(--red)">'+res.msg+'</b><br><br>'+
+        'ADB does not work on the RC2 (deliberately blocked in firmware) — this uses MTP only. '+
+        'If this keeps failing, fall back to the manual method in the README.</div>';
+      return;
+    }
+    renderMissionSlots(res.slots);
+  });
+}
+function closeUploadPicker(){ document.getElementById('picker-overlay').classList.remove('visible'); }
+function renderMissionSlots(slots){
+  var el = document.getElementById('picker-list');
+  if(!slots.length){ el.innerHTML='<div class="empty-hint">No mission slots found.</div>'; return; }
+  el.innerHTML = slots.map(function(s){
+    var meta = [];
+    if(s.modified) meta.push(s.modified);
+    if(s.waypoints) meta.push('<b>'+s.waypoints+'</b> waypoints');
+    if(s.lat!=null && s.lon!=null) meta.push(s.lat.toFixed(4)+', '+s.lon.toFixed(4));
+    var title = s.name || '(unnamed mission)';
+    return '<div class="slot-row">' +
+      '<div class="slot-info"><div>'+title+'</div>' +
+        '<div class="meta">'+(meta.join(' &middot; ')||'no details read')+'</div>' +
+        '<div class="uuid">'+s.uuid+'</div></div>' +
+      '<button class="primary" onclick="confirmUploadToSlot(\''+s.uuid+'\')">Replace</button>' +
+    '</div>';
+  }).join('');
+}
+function confirmUploadToSlot(uuid){
+  if(!confirm('Overwrite mission slot '+uuid.slice(0,8)+'... on the controller with the current mission? This cannot be undone.')) return;
+  document.getElementById('picker-list').innerHTML='';
+  document.getElementById('picker-log').innerHTML=''; document.getElementById('picker-log').classList.add('visible');
+  pywebview.api.upload_to_rc_slot(cfg, waypoints, uuid).then(function(res){
+    setStatus(res.msg);
+    if(res.ok){
+      appendUploadLog('Done. '+res.msg);
+      setTimeout(closeUploadPicker, 1500);
+    } else {
+      appendUploadLog('FAILED: '+res.msg, true);
     }
   });
 }

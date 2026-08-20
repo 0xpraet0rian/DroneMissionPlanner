@@ -121,17 +121,26 @@ a throwaway waypoint mission in DJI Fly on the controller first, connect the RC 
 PC, then find that mission's folder and overwrite the file inside it.
 
 **Upload to RC** does this over MTP (the same way Windows Explorer talks to the
-controller — no extra driver needed beyond `pywin32`). **ADB does not work for this on
-the RC2** — its `adbd` is present but firmware-hardened to refuse real host connections,
-which is why `adb devices` shows it stuck "offline" forever no matter what you try with
-cables, drivers, or developer-options toggling. That's confirmed by independent
-reverse-engineering of the RC2, not a driver problem on your end, so don't waste time
-chasing an ADB fix here.
+controller — no extra driver needed beyond `pywin32`), and always asks first: it lists
+every mission slot on the controller — modified time, waypoint count, and an approximate
+location, each read straight from the mission file already sitting there — and you pick
+which one gets replaced. It does **not** guess or auto-pick the newest one for you. Worth
+knowing: DJI Fly's own mission title (the name you type when saving on the controller)
+isn't stored anywhere MTP can reach, so it can't be shown here — nobody's found where
+Android/RC2 keeps it, unlike iOS which has an accessible database for it. The upload
+dialog shows a live log of each step as it happens, so if something goes wrong you can see
+exactly where.
 
-If the automatic upload fails, or you don't have `pywin32` installed, do it by hand:
+**ADB does not work for this on the RC2** — its `adbd` is present but firmware-hardened to
+refuse real host connections, which is why `adb devices` shows it stuck "offline" forever
+no matter what you try with cables, drivers, or developer-options toggling. That's
+confirmed by independent reverse-engineering of the RC2, not a driver problem on your
+end, so don't waste time chasing an ADB fix here.
+
+If the upload dialog doesn't work, or you don't have `pywin32` installed, do it by hand:
 connect over USB, browse to
 `This PC \ DJI RC 2 \ Internal shared storage \ Android \ data \ dji.go.v5 \ files \
-waypoint`, find the newest subfolder — it's named with a GUID, and contains a `.kmz` file
+waypoint`, pick a mission subfolder — it's named with a GUID, and contains a `.kmz` file
 sharing that same GUID as its filename — rename your exported mission to match that exact
 filename, and overwrite it. Reopen the mission in DJI Fly and it loads your real
 waypoints instead of the dummy ones.
