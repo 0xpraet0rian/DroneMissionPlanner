@@ -2086,10 +2086,8 @@ function renderSetup(){
         '<input id="rot-slider" type="range" min="0" max="359" value="'+cfg.rotationDeg+'" style="width:100%;accent-color:var(--orange);" ' +
         'oninput="cfg.rotationDeg=parseFloat(this.value);document.getElementById(\'rot-val\').textContent=this.value+\'°\';refreshEstimate()"></div>' +
       '<button style="width:100%;margin-top:2px;" onclick="autoRotate()" title="Align the sweep to the area\'s longest edge, minimizing wasted transit distance">&#8635; Auto-rotate to minimize flight distance</button>' +
-      '<div class="field-row" style="margin-top:6px;">' +
-        '<div class="field"><label>Wind from (&deg;, optional)</label><input id="wind-dir" type="number" min="0" max="359" placeholder="e.g. 270"></div>' +
-        '<div class="field" style="display:flex;align-items:flex-end;"><button style="width:100%;" onclick="rotateForWind()" title="Fly the long passes into/with the wind rather than across it — steadier ground speed and less battery spent fighting a crosswind on every pass">&#8634; Align to wind</button></div>' +
-      '</div>' +
+      '<div class="field" style="margin-top:6px;"><label>Wind from (&deg;, optional)</label><input id="wind-dir" type="number" min="0" max="359" placeholder="e.g. 270"></div>' +
+      '<button style="width:100%;margin-top:2px;" onclick="rotateForWind()" title="Fly the long passes into/with the wind rather than across it — steadier ground speed and less battery spent fighting a crosswind on every pass">&#8634; Align to wind</button>' +
       '<div class="hint">Coverage-path research (e.g. Boustrophedon CPP for UAV surveys in wind) finds sweeping parallel to the wind (not perpendicular) covers faster with steadier speed. Enter the direction wind is coming FROM if you know it.</div>' +
       '<div class="field" style="margin-top:8px;"><label>Turn style</label><select onchange="cfg.turnMode=this.value">' +
         opt('toPointAndStopWithDiscontinuityCurvature',cfg.turnMode,'Stop at each point (precise — recommended for mapping)')+
