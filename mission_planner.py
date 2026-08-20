@@ -2054,10 +2054,8 @@ function renderSetup(){
 
     // ── Site markup — no-fly holes and survey-control reference points ──
     '<div class="panel-section"><h4>Site markup</h4>' +
-    '<div class="field-row">' +
-      '<div class="field"><button style="width:100%;" onclick="startDraw(\'exclude\')" title="Draw a hole inside a grid survey area that the flight path skips entirely">&#9888; Draw no-fly zone</button></div>' +
-      '<div class="field"><button style="width:100%;" onclick="startDraw(\'gcp\')" title="Drop reference markers at known coordinates for correcting the orthomosaic afterward in Pix4D/Metashape/WebODM">&#128204; Place ground control point</button></div>' +
-    '</div>' +
+    '<button style="width:100%;" onclick="startDraw(\'exclude\')" title="Draw a hole inside a grid survey area that the flight path skips entirely">&#9888; Draw no-fly zone</button>' +
+    '<button style="width:100%;margin-top:6px;" onclick="startDraw(\'gcp\')" title="Drop reference markers at known coordinates for correcting the orthomosaic afterward in Pix4D/Metashape/WebODM">&#128204; Place GCP</button>' +
     (exclusionZones.length ?
       '<div class="hint" style="margin-top:6px;">'+exclusionZones.length+' no-fly zone(s) active on the current grid area &mdash; '+
       '<a href="#" onclick="clearExclusionZones();return false;">clear all</a></div>' : '') +
@@ -2692,7 +2690,21 @@ function prepareReplay(){
 
 function ensureReplayMarker(){
   if(replay.marker) return;
-  var icon=L.divIcon({className:'', html:'<div class="drone-marker">&#128257;</div>', iconSize:[26,26], iconAnchor:[13,13]});
+  // A quadcopter glyph drawn from scratch -- U+1F501 (the repeat-arrows emoji)
+  // reads as a "replay" button, not a drone, which is exactly backwards for a
+  // marker whose whole job is to look like the aircraft flying the route.
+  var droneSvg = '<svg width="22" height="22" viewBox="0 0 24 24">' +
+    '<g stroke="var(--orange)" stroke-width="1.6" stroke-linecap="round">' +
+      '<line x1="12" y1="12" x2="4" y2="4"/><line x1="12" y1="12" x2="20" y2="4"/>' +
+      '<line x1="12" y1="12" x2="4" y2="20"/><line x1="12" y1="12" x2="20" y2="20"/>' +
+    '</g>' +
+    '<g fill="var(--orange)">' +
+      '<circle cx="4" cy="4" r="3"/><circle cx="20" cy="4" r="3"/>' +
+      '<circle cx="4" cy="20" r="3"/><circle cx="20" cy="20" r="3"/>' +
+    '</g>' +
+    '<rect x="8.5" y="8.5" width="7" height="7" rx="2" fill="#1a1a1a" stroke="var(--orange)" stroke-width="1.4"/>' +
+  '</svg>';
+  var icon=L.divIcon({className:'', html:'<div class="drone-marker">'+droneSvg+'</div>', iconSize:[26,26], iconAnchor:[13,13]});
   replay.marker=L.marker([waypoints[0].lat,waypoints[0].lon],{icon:icon,zIndexOffset:2000}).addTo(wpGroup);
 }
 
