@@ -45,8 +45,49 @@ might disagree with what actually gets built.
 **Capture-purpose presets** set the gimbal angle (and matching overlap %) from published
 sources instead of a guessed default: flat 2D mapping, elevation/DEM work (a slight
 oblique tilt breaks the "doming" distortion pure-nadir flights are known to produce),
-3D/building models, facade inspection, roof inspection, corridor documentation. Each one
-names where the number came from.
+3D/building models, facade inspection, roof inspection, corridor documentation, and two
+archaeology-oriented presets covered below. Each one names where the number came from.
+
+### What a cheap RGB drone can do for archaeology / earth science
+
+Everything below assumes a consumer drone with an ordinary RGB camera — a Mini-class
+aircraft, no thermal or multispectral payload — because that's what this app targets and
+what most people actually own. It's still a real research toolkit for that hardware, not
+a compromise:
+
+- **SfM micro-relief surveys** (the *Topographic / elevation model* preset). Dense
+  structure-from-motion photogrammetry from an ordinary RGB drone has replaced laser
+  scanning as the affordable way to map subtle earthworks, reportedly reaching 0.02-0.15m
+  accuracy with proper ground control (Verhoeven, 2012). This is exactly what the app's
+  **ground control points** feature is for — place them on the ground before flying,
+  export the CSV, and hand it to whatever SfM software (Agisoft Metashape, WebODM, Pix4D)
+  processes the photos afterward; the app doesn't do the 3D reconstruction itself.
+- **Shadow marks and crop/soil marks** (the new *Archaeological survey* preset). Subtle
+  earthworks show up in long shadows from low sun angles — fly within an hour or two of
+  sunrise/sunset, not midday. Buried walls and ditches change how crops grow above them;
+  the effect is strongest in specific seasonal/moisture windows (Mediterranean spring
+  cereal fields, or drought-stressed grass, per the published cropmark literature) and is
+  genuinely transient — a single flight can miss it, so this is a case where re-flying the
+  same saved project across a season matters more than for other capture purposes. A
+  consumer RGB sensor can't compute true NDVI (that needs near-infrared), but the ExG/
+  VARI/GLI visible-light indices already used for the vegetation preset are the
+  established substitute in the actual published studies, not an improvised workaround.
+- **Excavation trench documentation** (the new *Excavation trench recording* preset).
+  Some real digs (the Zagora excavations, among others) fly a drone over every open trench
+  daily, building up a 3D time series of the dig instead of one final snapshot — what the
+  literature calls "4D archaeology." Save the project under a dated name each day and
+  re-fly the same path as the trench deepens. Close-range reconstruction needs denser
+  overlap (85/80 here) than wide-area mapping, and a single nadir pass won't reconstruct
+  the vertical trench walls — add oblique shots by hand in Manual mode for those.
+
+### What this app deliberately doesn't try to do
+
+Thermal anomaly detection and multispectral NDVI both need sensor hardware a Mini-class
+drone doesn't have — those are Zenmuse-payload/enterprise-drone territory, not something
+software can substitute for. LiDAR canopy penetration (the technique behind headline
+Maya/Angkor discoveries) needs an actual laser scanner. If you later fly something with
+one of those payloads, the mission math here (spacing, overlap, turn modes) still
+applies — only the gimbal/sensor assumptions would need adjusting.
 
 **Battery-aware.** Rated flight times for the Mini 4 Pro, Mini 5 Pro, Air 3/3S, and
 Mavic 3/3 Pro are built in, including the extended "Plus" batteries where they exist.

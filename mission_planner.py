@@ -267,7 +267,39 @@ GIMBAL_PRESETS = {
         'note': 'A 5-10° tilt off nadir breaks the near-parallel imaging geometry that '
                 'causes "doming" — a well-documented systematic vertical error in pure-nadir '
                 'DEMs (James & Robson, 2014, Earth Surface Processes and Landforms). Pair '
-                'with Crosshatch for a proper convergent network.',
+                'with Crosshatch for a proper convergent network. The same technique doubles '
+                'as micro-relief survey for archaeological earthworks, where SfM photogrammetry '
+                'has replaced laser scanning as the affordable option (Verhoeven, 2012) — '
+                'ground control points, placed under Site markup, are what get this into the '
+                '0.02-0.15m accuracy range the published results report.',
+    },
+    'archaeo_marks': {
+        'label': 'Archaeological survey — shadow & crop/soil marks', 'pitch': -90, 'overlap': (75, 65),
+        'note': 'Straight-down, same geometry as flat mapping — the technique lives in *when* '
+                'you fly, not the gimbal angle. Shadow marks (subtle earthworks like ridge-and-'
+                'furrow or hillforts) need raking light, so fly within an hour or two of sunrise '
+                'or sunset, not midday. Crop and soil marks come from buried features changing '
+                'how plants grow above them, and are only visible during specific windows — '
+                'literature on Mediterranean sites finds spring cereal fields most reliable, and '
+                'drought/moisture-stress periods sharpen the effect since stressed vegetation '
+                'shows differential growth more clearly. A consumer RGB drone can\'t capture true '
+                'NDVI, but the ExG/VARI/GLI visible-light indices (see Vegetation preset) are the '
+                'established substitute in published cropmark studies. Marks are transient — a '
+                'single flight can miss them entirely, so repeat surveys across a season (Save/'
+                'Load the same project) matter more here than for most other capture purposes.',
+    },
+    'excavation': {
+        'label': 'Excavation trench recording (close-range, repeat)', 'pitch': -75, 'overlap': (85, 80),
+        'note': 'Very close-range, high-overlap SfM to document an open trench in 3D — the '
+                'digital-archaeology equivalent of daily hand-drawn section drawings. Projects '
+                'like the Zagora excavations fly this literally every day the trench is open, '
+                'building a stratigraphic time series ("4D archaeology") instead of a single '
+                'snapshot; Save the project each day under a dated name and re-fly the same '
+                'path as the trench deepens. Higher overlap than standard mapping (85/80) '
+                'because close-range reconstruction needs a denser network than wide-area '
+                'coverage does. Fly low and slow, and add oblique passes by hand in Manual mode '
+                'for the trench walls, since a single nadir pass won\'t reconstruct vertical '
+                'sections.',
     },
     '3d_model': {
         'label': '3D model / building / urban scene', 'pitch': -45, 'overlap': (80, 70),
