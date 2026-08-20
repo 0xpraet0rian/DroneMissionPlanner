@@ -363,6 +363,15 @@ DEFAULT_MISSION_CONFIG = {
     'orbitTurnMode': 'toPointAndPassWithContinuityCurvature',
     'overviewEnabled': False, 'overviewAltitude': 0, 'overviewGimbal': -60,
     'delayAtWaypoint': 0,
+    # Distance/speed alone assumes the aircraft is instantly at cruise speed and
+    # stops instantly too -- physically impossible, and badly wrong for the
+    # default stop-and-rotate turn mode with tightly-spaced waypoints, where the
+    # aircraft may never even reach cruise speed before decelerating for the next
+    # stop. 1.4 m/s^2 is the measured average accel/decel for a small quadcopter
+    # in acceleration-aware waypoint path-planning research (Xu et al., 2021,
+    # MDPI Drones journal), which found ignoring this inflates flight-time
+    # accuracy errors by up to 1.7x versus reality -- exactly this effect.
+    'droneAccel': 1.4,
     'flyToWaylineMode': 'safely', 'finishAction': 'goHome',
     'exitOnRCLost': 'executeLostAction', 'executeRCLostAction': 'goBack',
     'takeOffSecurityHeight': 20, 'globalTransitionalSpeed': 10,
@@ -653,19 +662,47 @@ def usable_battery_seconds(cfg):
     reserve = cfg.get('reserveFraction', BATTERY_RESERVE_FRACTION_DEFAULT)
     return max(60.0, rated_min * 60.0 * realistic * (1 - reserve))
 
+def _is_stop_turn(mode):
+    # Every turn mode except the smooth-flythrough one brings the aircraft to a
+    # stop at the waypoint -- see build_waylines_wpml's turn-mode comments.
+    return mode != 'toPointAndPassWithContinuityCurvature'
+
+def leg_time_sec(dist_m, cruise_speed, accel, must_stop):
+    """Time to cover one leg, modeling acceleration/deceleration instead of
+    assuming instant cruise speed. When the aircraft stops at either end
+    (must_stop), a leg shorter than the distance needed to reach cruise speed
+    never actually gets there -- that's the triangular-profile branch, and it's
+    the common case for a tightly-spaced grid survey in the default stop-and-
+    rotate turn mode. See droneAccel's comment in DEFAULT_MISSION_CONFIG for
+    where the default acceleration figure comes from."""
+    if cruise_speed <= 0:
+        return 0.0
+    if not must_stop:
+        return dist_m / cruise_speed
+    accel = accel or 1.4
+    d_half = cruise_speed ** 2 / (2 * accel)
+    if dist_m >= 2 * d_half:
+        return 2 * (cruise_speed / accel) + (dist_m - 2 * d_half) / cruise_speed
+    return 2 * math.sqrt(dist_m / accel)
+
 def split_mission_by_battery(waypoints, cfg):
     """Greedily group waypoints into flight-time-budgeted batches, each a
     standalone sub-mission: fly it, swap battery, load the next one."""
     if not waypoints:
         return []
     budget = usable_battery_seconds(cfg)
+    accel = cfg.get('droneAccel', 1.4)
+    default_turn = cfg.get('turnMode', 'toPointAndStopWithDiscontinuityCurvature')
     batches = []
     current = [waypoints[0]]
     elapsed = waypoints[0].get('hover', 0) or 0
     for i in range(1, len(waypoints)):
         prev_wp, wp = waypoints[i - 1], waypoints[i]
         speed = prev_wp.get('speed') or cfg.get('speed') or 5
-        leg = haversine_m(prev_wp['lat'], prev_wp['lon'], wp['lat'], wp['lon']) / speed + (wp.get('hover', 0) or 0)
+        dist = haversine_m(prev_wp['lat'], prev_wp['lon'], wp['lat'], wp['lon'])
+        must_stop = (_is_stop_turn(prev_wp.get('turn_mode', default_turn))
+                     or _is_stop_turn(wp.get('turn_mode', default_turn)))
+        leg = leg_time_sec(dist, speed, accel, must_stop) + (wp.get('hover', 0) or 0)
         if elapsed + leg > budget and current:
             batches.append(current)
             current = []
@@ -1260,11 +1297,17 @@ class Api:
             batches = split_mission_by_battery(waypoints, cfg)
             budget = usable_battery_seconds(cfg)
 
+            accel = cfg.get('droneAccel', 1.4)
+            default_turn = cfg.get('turnMode', 'toPointAndStopWithDiscontinuityCurvature')
+
             def batch_time(b):
                 t = 0.0
                 for i in range(1, len(b)):
                     speed = b[i - 1].get('speed') or cfg.get('speed') or 5
-                    t += haversine_m(b[i - 1]['lat'], b[i - 1]['lon'], b[i]['lat'], b[i]['lon']) / speed
+                    dist = haversine_m(b[i - 1]['lat'], b[i - 1]['lon'], b[i]['lat'], b[i]['lon'])
+                    must_stop = (_is_stop_turn(b[i - 1].get('turn_mode', default_turn))
+                                 or _is_stop_turn(b[i].get('turn_mode', default_turn)))
+                    t += leg_time_sec(dist, speed, accel, must_stop)
                     t += b[i].get('hover', 0) or 0
                 return t
 
@@ -1882,8 +1925,13 @@ function refreshEstimate(){
   if(!est){ el.innerHTML=''; return; }
   var shutter=recommendedShutterSpeed(cfg);
   var interval=cfg.speed ? (est.forward/cfg.speed) : 0;
-  var distM=est.photos>0 ? est.photos*est.forward : 0; // rough distance estimate for flight time
-  var flightSec = distM/(cfg.speed||1);
+  // Real waypoints don't exist yet at this point (pre-generation estimate), so
+  // model N-1 legs of roughly est.forward each, accel-aware the same way the
+  // real per-waypoint calculation is -- a flat distance/speed here would repeat
+  // the same undercount a tightly-spaced grid runs into once actually generated.
+  var legCount = Math.max(0, est.photos-1);
+  var mustStop = isStopTurn(cfg.turnMode);
+  var flightSec = legCount * legTimeSec(est.forward, cfg.speed||1, cfg.droneAccel, mustStop);
   var usableSec = usableBatteryMinutes(cfg)*60;
   var batteries = Math.max(1, Math.ceil(flightSec/usableSec));
   var warn = batteries>1
@@ -2189,6 +2237,7 @@ function renderSetup(){
         '<div class="field"><label>Image width (px)</label><input type="number" value="'+cfg.img_w+'" onchange="cfg.img_w=parseInt(this.value)||1;refreshEstimate()"></div>' +
       '</div>' +
       '<div class="field"><label>Image height (px)</label><input type="number" value="'+cfg.img_h+'" onchange="cfg.img_h=parseInt(this.value)||1;refreshEstimate()"></div>' +
+      '<div class="field" style="margin-top:8px;"><label>Accel/decel (m/s&sup2;)'+help('Used to estimate real flight time and battery-split points -- distance/speed alone assumes the aircraft is instantly at cruise speed and stops instantly, which overstates how fast a tightly-spaced stop-and-rotate grid actually flies. 1.4 m/s&sup2; is a measured average for a small quadcopter (Xu et al., 2021, MDPI Drones journal); lower it for a heavily-loaded aircraft, raise it if yours feels snappier in Sport-like modes.')+'</label><input type="number" step="0.1" min="0.1" value="'+cfg.droneAccel+'" onchange="cfg.droneAccel=parseFloat(this.value)||1.4;refreshEstimate()"></div>' +
     '</div></details></div>' +
 
     // ── Safety & mission behaviour — sane defaults, rarely touched ──
@@ -2671,8 +2720,7 @@ function updateStats(){
   var dist=0;
   for(var i=1;i<waypoints.length;i++){ dist += haversine(waypoints[i-1].lat,waypoints[i-1].lon,waypoints[i].lat,waypoints[i].lon); }
   var photoCount = waypoints.filter(w=>w.photo).length;
-  var avgSpeed = cfg.speed || 5;
-  var flightSec = dist/avgSpeed + waypoints.reduce((s,w)=>s+(w.hover||0),0);
+  var flightSec = computeFlightSeconds(waypoints, cfg);
   var mins = Math.floor(flightSec/60), secs = Math.round(flightSec%60);
   var usableSec = usableBatteryMinutes(cfg)*60;
   var batteries = Math.max(1, Math.ceil(flightSec/usableSec));
@@ -2680,17 +2728,58 @@ function updateStats(){
     ? '<span style="color:var(--orange2)">&#128267; ~'+batteries+' batteries needed &mdash; use "Export by Battery" to split automatically</span>' : '';
   var warn = waypoints.length>500
     ? '<span style="color:var(--orange2)">&#9888; '+waypoints.length+' waypoints is a lot &mdash; consider lowering overlap %, raising altitude, or splitting into multiple missions</span>' : '';
+  // Distance/speed alone would say this mission is faster than it really is
+  // whenever waypoints are close enough together (relative to cruise speed and
+  // Accel/decel under Advanced) that the aircraft keeps stopping and re-
+  // accelerating without ever reaching cruise speed -- flag it rather than
+  // let the flight-time number silently be the only sign something's off.
+  var naiveSec = dist/(cfg.speed||5);
+  var accelWarn = (flightSec > naiveSec*1.3 && waypoints.length>3)
+    ? '<span style="color:var(--orange2)">&#9888; Waypoints are closely spaced for the stop-and-rotate turn style &mdash; cruise speed is rarely reached, which is why flight time is well above straight distance&divide;speed. Raise altitude, lower overlap, or switch Turn style to smooth flythrough.</span>' : '';
   document.getElementById('wp-stats').innerHTML =
     '<span><b>'+waypoints.length+'</b> waypoints</span>' +
     '<span><b>'+(dist/1000).toFixed(2)+'</b> km</span>' +
     '<span><b>~'+mins+'m '+secs+'s</b> flight time</span>' +
-    '<span><b>'+photoCount+'</b> photos</span>' + battWarn + warn;
+    '<span><b>'+photoCount+'</b> photos</span>' + battWarn + warn + accelWarn;
 }
 function haversine(lat1,lon1,lat2,lon2){
   var R=6371000, toRad=d=>d*Math.PI/180;
   var dp=toRad(lat2-lat1), dl=toRad(lon2-lon1);
   var a=Math.sin(dp/2)**2+Math.cos(toRad(lat1))*Math.cos(toRad(lat2))*Math.sin(dl/2)**2;
   return 2*R*Math.asin(Math.sqrt(a));
+}
+function isStopTurn(mode){
+  // Mirrors Python's _is_stop_turn -- every turn mode except smooth flythrough
+  // brings the aircraft to a stop at the waypoint.
+  return mode !== 'toPointAndPassWithContinuityCurvature';
+}
+function legTimeSec(distM, cruiseSpeed, accel, mustStop){
+  // Mirrors Python's leg_time_sec exactly -- see droneAccel's comment in
+  // DEFAULT_MISSION_CONFIG (Python) for why distance/speed alone undercounts
+  // flight time, sometimes by several times over, for closely-spaced
+  // waypoints with a stop-and-rotate turn mode.
+  if(!cruiseSpeed || cruiseSpeed<=0) return 0;
+  if(!mustStop) return distM/cruiseSpeed;
+  accel = accel || 1.4;
+  var dHalf = (cruiseSpeed*cruiseSpeed)/(2*accel);
+  if(distM >= 2*dHalf) return 2*(cruiseSpeed/accel) + (distM-2*dHalf)/cruiseSpeed;
+  return 2*Math.sqrt(distM/accel);
+}
+// Shared, accel-aware flight-time calculation -- used everywhere flight time
+// is estimated instead of four separate dist/speed copies (each missing the
+// same acceleration physics; see the /loop this was fixed in for context).
+function computeFlightSeconds(wps, c){
+  if(!wps || wps.length<2) return (wps&&wps[0]&&wps[0].hover)||0;
+  var accel = c.droneAccel||1.4, defaultTurn = c.turnMode||'toPointAndStopWithDiscontinuityCurvature';
+  var t = wps[0].hover||0;
+  for(var i=1;i<wps.length;i++){
+    var a=wps[i-1], b=wps[i];
+    var speed = a.speed || c.speed || 5;
+    var dist = haversine(a.lat,a.lon,b.lat,b.lon);
+    var mustStop = isStopTurn(a.turn_mode||defaultTurn) || isStopTurn(b.turn_mode||defaultTurn);
+    t += legTimeSec(dist, speed, accel, mustStop) + (b.hover||0);
+  }
+  return t;
 }
 
 // ── Live mission replay (basic) ──────────────────────────────────────────
@@ -2895,9 +2984,7 @@ function timestampTag(){
   return d.getFullYear()+pad(d.getMonth()+1)+pad(d.getDate())+'-'+pad(d.getHours())+pad(d.getMinutes());
 }
 function buildExportFilename(wps){
-  var dist=0;
-  for(var i=1;i<wps.length;i++) dist+=haversine(wps[i-1].lat,wps[i-1].lon,wps[i].lat,wps[i].lon);
-  var flightSec = dist/(cfg.speed||5) + wps.reduce((s,w)=>s+(w.hover||0),0);
+  var flightSec = computeFlightSeconds(wps, cfg);
   var mins=Math.floor(flightSec/60), secs=Math.round(flightSec%60);
   var photoCount = wps.filter(w=>w.photo).length;
   return sanitizeMissionName(missionName)+'_'+timestampTag()+'_'+mins+'m'+secs+'s_'+photoCount+'p_'+droneSlug();
@@ -2990,9 +3077,7 @@ function appendUploadLog(msg, isErr){
   log.scrollTop = log.scrollHeight;
 }
 function currentMissionBatteries(){
-  var dist=0;
-  for(var i=1;i<waypoints.length;i++) dist+=haversine(waypoints[i-1].lat,waypoints[i-1].lon,waypoints[i].lat,waypoints[i].lon);
-  var flightSec = dist/(cfg.speed||5) + waypoints.reduce((s,w)=>s+(w.hover||0),0);
+  var flightSec = computeFlightSeconds(waypoints, cfg);
   var usableSec = usableBatteryMinutes(cfg)*60;
   return {minutes: flightSec/60, batteries: Math.max(1, Math.ceil(flightSec/usableSec))};
 }

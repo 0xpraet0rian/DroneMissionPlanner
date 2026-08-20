@@ -42,6 +42,18 @@ recommended shutter speed to avoid motion blur — **before** you commit to it, 
 by literally running the real generator client-side rather than a rough formula that
 might disagree with what actually gets built.
 
+Flight time itself accounts for acceleration, not just distance÷speed: the default
+stop-and-rotate turn mode means the aircraft actually stops and re-accelerates at every
+waypoint, and on a tightly-spaced grid — low altitude, high overlap — it can spend the
+whole mission never reaching cruise speed at all. A distance÷speed estimate misses that
+entirely and can undercount real flight time several times over; this one models the
+accelerate/cruise/decelerate profile per leg (1.4 m/s² default, editable under Setup →
+Aircraft & camera → Advanced, sourced from real acceleration-aware path-planning
+research) and warns in the Waypoints tab when a mission is spending most of its time
+never reaching cruise speed. It also feeds directly into "Export by Battery," so a
+mission that looked like it fit on one battery under the old flat estimate won't
+silently turn out not to.
+
 **Capture-purpose presets** set the gimbal angle (and matching overlap %) from published
 sources instead of a guessed default: flat 2D mapping, vegetation/crop health, elevation/
 DEM work (a slight oblique tilt breaks the "doming" distortion pure-nadir flights are
