@@ -86,10 +86,15 @@ instead of a circle, so orbit missions use the smooth spline mode by default, wh
 what actually produces a circular flight path. Both are overridable per mission type.
 
 **No-fly / exclusion zones.** Draw a hole (a building, a hazard, restricted airspace)
-inside a grid survey area and the coverage pattern skips it entirely instead of flying
-straight over it. Works with crosshatch and 3D-mapping too, and the live estimate honors
-it exactly — it runs the same coverage math client-side, not an approximation, same as
-the rest of the estimate.
+and grid, corridor, and overview-lap coverage all skip it instead of flying straight over
+it — crosshatch and 3D-mapping included. Nothing gets left out silently: if a zone would
+actually remove waypoints from the mission you're generating, you're asked first, with a
+count, and can choose to ignore the zone for that mission instead. A manually-placed
+waypoint (Manual mode) inside a zone gets a warning instead — you clicked there on
+purpose, so it's placed, not blocked. The live grid estimate honors zones exactly too —
+it runs the same coverage math client-side, not an approximation, same as the rest of the
+estimate. (Orbit missions aren't affected — a fixed-radius circle around a point isn't an
+area-coverage sweep, so there's nothing for a zone to filter there.)
 
 **Ground control points.** Drop reference markers at known coordinates directly on the
 map — click to rename, click the &times; to remove — and export them as a plain

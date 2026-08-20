@@ -501,11 +501,15 @@ def generate_3d_mapping(polygon_latlon, cfg, exclusions_latlon=None):
 
     return nadir_pts + oblique_pts
 
-def generate_corridor(line_latlon, cfg):
+def generate_corridor(line_latlon, cfg, exclusions_latlon=None):
     if len(line_latlon) < 2:
         raise ValueError('A corridor route needs at least 2 points')
     ref_lat, ref_lon = line_latlon[0][0], line_latlon[0][1]
     pts_xy = [to_xy(p[0], p[1], ref_lat, ref_lon) for p in line_latlon]
+    # cf=1, sf=0 is an identity rotation -- corridor coverage doesn't rotate
+    # into a scan frame the way grid does, so exclusions just need projecting
+    # into the same plain local-xy frame the route itself uses.
+    exclude_xypolys = _project_exclusions(exclusions_latlon, ref_lat, ref_lon, 1.0, 0.0)
 
     side_spacing, forward_spacing = coverage_spacing(cfg)
 
@@ -548,6 +552,8 @@ def generate_corridor(line_latlon, cfg):
         for x, y, heading in pass_samples:
             perp = heading + math.pi / 2
             ox, oy = x + off * math.sin(perp), y + off * math.cos(perp)
+            if _in_any_polygon(ox, oy, exclude_xypolys):
+                continue
             lat, lon = from_xy(ox, oy, ref_lat, ref_lon)
             waypoints.append({'lat': lat, 'lon': lon, 'alt': cfg['altitude'], 'speed': cfg['speed'],
                                'gimbal': cfg.get('gimbalPitch', -90), 'heading_mode': 'followWayline',
@@ -591,7 +597,7 @@ def generate_orbit(center_lat, center_lon, cfg):
                                'turn_mode': cfg.get('orbitTurnMode', 'toPointAndPassWithContinuityCurvature')})
     return waypoints
 
-def generate_overview(polygon_latlon, cfg):
+def generate_overview(polygon_latlon, cfg, exclusions_latlon=None):
     """A single higher-altitude lap around the site boundary with a photo at every
     corner plus mid-edge points — a quick 'whole site in context' pass, meant to be
     flown in addition to a detailed grid, not instead of it."""
@@ -599,18 +605,24 @@ def generate_overview(polygon_latlon, cfg):
         raise ValueError('An overview lap needs at least 3 points')
     alt = cfg.get('overviewAltitude') or (cfg['altitude'] * 1.5)
     speed = cfg.get('speed', 8)
+    ref_lat, ref_lon = polygon_latlon[0][0], polygon_latlon[0][1]
+    exclude_xypolys = _project_exclusions(exclusions_latlon, ref_lat, ref_lon, 1.0, 0.0)
     waypoints = []
     n = len(polygon_latlon)
     for i in range(n):
         a = polygon_latlon[i]
         b = polygon_latlon[(i + 1) % n]
-        waypoints.append({'lat': a[0], 'lon': a[1], 'alt': alt, 'speed': speed,
-                           'gimbal': cfg.get('overviewGimbal', -60), 'heading_mode': 'followWayline',
-                           'photo': True, 'hover': 0})
+        ax, ay = to_xy(a[0], a[1], ref_lat, ref_lon)
+        if not _in_any_polygon(ax, ay, exclude_xypolys):
+            waypoints.append({'lat': a[0], 'lon': a[1], 'alt': alt, 'speed': speed,
+                               'gimbal': cfg.get('overviewGimbal', -60), 'heading_mode': 'followWayline',
+                               'photo': True, 'hover': 0})
         mid_lat, mid_lon = (a[0] + b[0]) / 2, (a[1] + b[1]) / 2
-        waypoints.append({'lat': mid_lat, 'lon': mid_lon, 'alt': alt, 'speed': speed,
-                           'gimbal': cfg.get('overviewGimbal', -60), 'heading_mode': 'followWayline',
-                           'photo': True, 'hover': 0})
+        mx, my = to_xy(mid_lat, mid_lon, ref_lat, ref_lon)
+        if not _in_any_polygon(mx, my, exclude_xypolys):
+            waypoints.append({'lat': mid_lat, 'lon': mid_lon, 'alt': alt, 'speed': speed,
+                               'gimbal': cfg.get('overviewGimbal', -60), 'heading_mode': 'followWayline',
+                               'photo': True, 'hover': 0})
     return waypoints
 
 def estimate_coverage(polygon_latlon, cfg):
@@ -1168,16 +1180,29 @@ class Api:
             return {'ok': False, 'msg': str(e)}
 
     # ── Generators ──
+    # exclusions is only ever filtered on the server side (never silently on the
+    # client), and only counted as "dropped" when the caller actually asked for
+    # zones to be applied -- the frontend decides whether to keep the filtered
+    # result or ask for an unfiltered regenerate based on excluded_count, so it
+    # can warn before anything gets silently skipped rather than after.
     def generate_grid(self, polygon, cfg, exclusions=None):
         try:
             fn = generate_3d_mapping if cfg.get('threeDMapping') else generate_grid
-            return {'ok': True, 'waypoints': fn(polygon, cfg, exclusions)}
+            wps = fn(polygon, cfg, exclusions)
+            excluded = 0
+            if exclusions:
+                excluded = max(0, len(fn(polygon, cfg, None)) - len(wps))
+            return {'ok': True, 'waypoints': wps, 'excluded_count': excluded}
         except Exception as e:
             return {'ok': False, 'msg': str(e)}
 
-    def generate_corridor(self, line, cfg):
+    def generate_corridor(self, line, cfg, exclusions=None):
         try:
-            return {'ok': True, 'waypoints': generate_corridor(line, cfg)}
+            wps = generate_corridor(line, cfg, exclusions)
+            excluded = 0
+            if exclusions:
+                excluded = max(0, len(generate_corridor(line, cfg, None)) - len(wps))
+            return {'ok': True, 'waypoints': wps, 'excluded_count': excluded}
         except Exception as e:
             return {'ok': False, 'msg': str(e)}
 
@@ -1187,9 +1212,13 @@ class Api:
         except Exception as e:
             return {'ok': False, 'msg': str(e)}
 
-    def generate_overview(self, polygon, cfg):
+    def generate_overview(self, polygon, cfg, exclusions=None):
         try:
-            return {'ok': True, 'waypoints': generate_overview(polygon, cfg)}
+            wps = generate_overview(polygon, cfg, exclusions)
+            excluded = 0
+            if exclusions:
+                excluded = max(0, len(generate_overview(polygon, cfg, None)) - len(wps))
+            return {'ok': True, 'waypoints': wps, 'excluded_count': excluded}
         except Exception as e:
             return {'ok': False, 'msg': str(e)}
 
@@ -2458,12 +2487,28 @@ function discardPending(){
   pendingKind=null; pendingGeom=null; pendingGenerated=false; renderSetup();
 }
 
+// A generate call that filtered out points for a marked no-fly zone hands back
+// how many it dropped rather than silently keeping them out -- this asks before
+// committing to that, and re-fetches an unfiltered result if the user would
+// rather ignore the zone(s) for this particular mission.
+function confirmExclusionDrop(res, regenerateWithoutExclusions){
+  if(!res.excluded_count){ return Promise.resolve(res.waypoints); }
+  var msg = res.excluded_count+' waypoint(s) fall inside a marked no-fly zone and were left out.\n\n'+
+    'OK — keep them left out (recommended)\nCancel — ignore the no-fly zone(s) for this mission and generate it anyway';
+  if(confirm(msg)) return Promise.resolve(res.waypoints);
+  return regenerateWithoutExclusions();
+}
+
 function mergeOverviewIfEnabled(polygonForOverview){
   if(!cfg.overviewEnabled || !polygonForOverview || polygonForOverview.length<3){
     return Promise.resolve();
   }
-  return pywebview.api.generate_overview(polygonForOverview, cfg).then(function(res){
-    if(res.ok) waypoints = waypoints.concat(res.waypoints);
+  var exclusions = exclusionZones.map(function(z){ return z.coords; });
+  return pywebview.api.generate_overview(polygonForOverview, cfg, exclusions).then(function(res){
+    if(!res.ok) return;
+    return confirmExclusionDrop(res, function(){
+      return pywebview.api.generate_overview(polygonForOverview, cfg, []).then(r=>r.waypoints);
+    }).then(function(wps){ waypoints = waypoints.concat(wps); });
   });
 }
 
@@ -2474,20 +2519,29 @@ function generateGridMission(polygon){
   var exclusions = exclusionZones.map(function(z){ return z.coords; });
   pywebview.api.generate_grid(polygon, cfg, exclusions).then(function(res){
     if(!res.ok){ hideProgress(); alert('Grid generation failed: '+res.msg); return; }
-    waypoints = res.waypoints; pois=[]; selectedWpIdx=null; pendingGenerated=true;
-    mergeOverviewIfEnabled(polygon).then(function(){
-      hideProgress();
-      renderWaypoints(); showTab('waypoints'); setStatus(waypoints.length+' waypoints generated');
+    confirmExclusionDrop(res, function(){
+      return pywebview.api.generate_grid(polygon, cfg, []).then(r=>r.waypoints);
+    }).then(function(wps){
+      waypoints = wps; pois=[]; selectedWpIdx=null; pendingGenerated=true;
+      mergeOverviewIfEnabled(polygon).then(function(){
+        hideProgress();
+        renderWaypoints(); showTab('waypoints'); setStatus(waypoints.length+' waypoints generated');
+      });
     });
   });
 }
 function generateCorridorMission(line){
   showProgress('Generating corridor...');
-  pywebview.api.generate_corridor(line, cfg).then(function(res){
-    hideProgress();
-    if(!res.ok){ alert('Corridor generation failed: '+res.msg); return; }
-    waypoints = res.waypoints; pois=[]; selectedWpIdx=null; pendingGenerated=true;
-    renderWaypoints(); showTab('waypoints'); setStatus(waypoints.length+' waypoints generated');
+  var exclusions = exclusionZones.map(function(z){ return z.coords; });
+  pywebview.api.generate_corridor(line, cfg, exclusions).then(function(res){
+    if(!res.ok){ hideProgress(); alert('Corridor generation failed: '+res.msg); return; }
+    confirmExclusionDrop(res, function(){
+      return pywebview.api.generate_corridor(line, cfg, []).then(r=>r.waypoints);
+    }).then(function(wps){
+      hideProgress();
+      waypoints = wps; pois=[]; selectedWpIdx=null; pendingGenerated=true;
+      renderWaypoints(); showTab('waypoints'); setStatus(waypoints.length+' waypoints generated');
+    });
   });
 }
 function generateOrbitMission(center){
@@ -2501,12 +2555,24 @@ function generateOrbitMission(center){
     renderWaypoints(); showTab('waypoints'); setStatus(waypoints.length+' waypoints generated');
   });
 }
+function isInsideAnyExclusionZone(lat,lon){
+  for(var i=0;i<exclusionZones.length;i++){
+    if(pointInPolygonJS(lat,lon,exclusionZones[i].coords)) return true;
+  }
+  return false;
+}
 function addManualWaypoint(lat,lon){
   waypoints.push({lat:lat, lon:lon, alt:cfg.altitude, speed:cfg.speed, gimbal:cfg.gimbalPitch,
     heading_mode:'followWayline', heading_angle:0, photo:true, hover:cfg.delayAtWaypoint||0});
   renderWaypoints();
   if(activeTab==='waypoints') renderWaypointsTab();
   setStatus(waypoints.length+' waypoints');
+  // Manual placement is a deliberate click, unlike a generated sweep, so this
+  // warns rather than silently dropping or blocking it -- you may genuinely
+  // want a waypoint inside a marked zone (e.g. re-checking why it's excluded).
+  if(isInsideAnyExclusionZone(lat,lon)){
+    alert('Heads up: this waypoint is inside a marked no-fly zone. It was placed anyway since you clicked there deliberately — delete it from the Waypoints tab if that was a mistake.');
+  }
 }
 
 function clearMission(){
