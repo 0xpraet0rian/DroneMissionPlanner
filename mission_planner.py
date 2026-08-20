@@ -330,6 +330,7 @@ DEFAULT_MISSION_CONFIG = {
     'corridorWidth': 40,
     'orbitRadius': 30, 'orbitPoints': 12, 'orbitClockwise': True,
     'orbitRings': 1, 'orbitMinAltitude': 0, 'orbitMaxAltitude': 0,
+    'orbitTurnMode': 'toPointAndPassWithContinuityCurvature',
     'overviewEnabled': False, 'overviewAltitude': 0, 'overviewGimbal': -60,
     'delayAtWaypoint': 0,
     'flyToWaylineMode': 'safely', 'finishAction': 'goHome',
@@ -531,7 +532,12 @@ def generate_orbit(center_lat, center_lon, cfg):
             pitch = -math.degrees(math.atan2(altitude, radius))
             waypoints.append({'lat': lat, 'lon': lon, 'alt': altitude, 'speed': cfg.get('speed', 5),
                                'gimbal': round(pitch), 'heading_mode': 'fixed', 'heading_angle': round(hdg),
-                               'photo': cfg.get('photo', True), 'hover': cfg.get('delayAtWaypoint', 0)})
+                               'photo': cfg.get('photo', True), 'hover': cfg.get('delayAtWaypoint', 0),
+                               # A circular path made of stop-and-rotate segments (the grid/corridor
+                               # default) looks like a stuttering polygon, not an orbit — DJI Fly's
+                               # own continuity-curvature turn mode is a centripetal Catmull-Rom spline
+                               # through the waypoints, which is what actually flies a smooth circle.
+                               'turn_mode': cfg.get('orbitTurnMode', 'toPointAndPassWithContinuityCurvature')})
     return waypoints
 
 def generate_overview(polygon_latlon, cfg):
@@ -773,7 +779,7 @@ def build_waylines_wpml(cfg, waypoints):
           <wpml:waypointHeadingPathMode>followBadArc</wpml:waypointHeadingPathMode>
         </wpml:waypointHeadingParam>
         <wpml:waypointTurnParam>
-          <wpml:waypointTurnMode>{cfg['turnMode']}</wpml:waypointTurnMode>
+          <wpml:waypointTurnMode>{wp.get('turn_mode', cfg['turnMode'])}</wpml:waypointTurnMode>
           <wpml:waypointTurnDampingDist>0</wpml:waypointTurnDampingDist>
         </wpml:waypointTurnParam>
         <wpml:useStraightLine>1</wpml:useStraightLine>{ag}
@@ -1933,7 +1939,18 @@ function renderSetup(){
         '<input id="rot-slider" type="range" min="0" max="359" value="'+cfg.rotationDeg+'" style="width:100%;accent-color:var(--orange);" ' +
         'oninput="cfg.rotationDeg=parseFloat(this.value);document.getElementById(\'rot-val\').textContent=this.value+\'°\';refreshEstimate()"></div>' +
       '<button style="width:100%;margin-top:2px;" onclick="autoRotate()" title="Align the sweep to the area\'s longest edge, minimizing wasted transit distance">&#8635; Auto-rotate to minimize flight distance</button>' +
-      '<div class="checkbox-row"><input type="checkbox" id="cb-xh" '+(cfg.crosshatch?'checked':'')+' onchange="cfg.crosshatch=this.checked;refreshEstimate()"><label for="cb-xh">Crosshatch (double grid) for thorough coverage</label></div>' +
+      '<div class="field-row" style="margin-top:6px;">' +
+        '<div class="field"><label>Wind from (&deg;, optional)</label><input id="wind-dir" type="number" min="0" max="359" placeholder="e.g. 270"></div>' +
+        '<div class="field" style="display:flex;align-items:flex-end;"><button style="width:100%;" onclick="rotateForWind()" title="Fly the long passes into/with the wind rather than across it — steadier ground speed and less battery spent fighting a crosswind on every pass">&#8634; Align to wind</button></div>' +
+      '</div>' +
+      '<div class="hint">Coverage-path research (e.g. Boustrophedon CPP for UAV surveys in wind) finds sweeping parallel to the wind (not perpendicular) covers faster with steadier speed. Enter the direction wind is coming FROM if you know it.</div>' +
+      '<div class="field" style="margin-top:8px;"><label>Turn style</label><select onchange="cfg.turnMode=this.value">' +
+        opt('toPointAndStopWithDiscontinuityCurvature',cfg.turnMode,'Stop at each point (precise — recommended for mapping)')+
+        opt('toPointAndStopWithContinuityCurvature',cfg.turnMode,'Slow smooth turn, still stops')+
+        opt('toPointAndPassWithContinuityCurvature',cfg.turnMode,'Smooth flythrough, never stops')+
+      '</select></div>' +
+      '<div class="hint">Stopping at each point keeps camera position/GSD consistent for photogrammetry — the standard choice for mapping. Smooth flythrough covers ground faster but can blur shots taken mid-turn.</div>' +
+      '<div class="checkbox-row" style="margin-top:8px;"><input type="checkbox" id="cb-xh" '+(cfg.crosshatch?'checked':'')+' onchange="cfg.crosshatch=this.checked;refreshEstimate()"><label for="cb-xh">Crosshatch (double grid) for thorough coverage</label></div>' +
       '<div class="hint">Second pass at 90° to the first. Roughly doubles photo count and flight time but fills gaps a single sweep misses on irregular sites.</div>' +
       '<div class="checkbox-row" style="margin-top:8px;"><input type="checkbox" id="cb-3d" '+(cfg.threeDMapping?'checked':'')+' onchange="cfg.threeDMapping=this.checked;refreshEstimate();renderSetup()"><label for="cb-3d">3D mapping (nadir + oblique double-grid)</label></div>' +
       '<div class="hint">Flies the area twice: once straight down, once tilted (rotated 90° from the first pass) — the method DJI Terra/Pix4D document for full 3D reconstruction, since a pure-nadir pass never images vertical surfaces like walls. Roughly doubles photo count.</div>' +
@@ -1970,6 +1987,12 @@ function renderSetup(){
       '</div>' +
       '<div class="checkbox-row"><input type="checkbox" id="cb-cw" '+(cfg.orbitClockwise?'checked':'')+' onchange="cfg.orbitClockwise=this.checked"><label for="cb-cw">Orbit clockwise</label></div>' +
       '<div class="hint">Gimbal continuously tracks the center point — no fixed pitch needed here.</div>' +
+      '<div class="field" style="margin-top:8px;"><label>Turn style</label><select onchange="cfg.orbitTurnMode=this.value">' +
+        opt('toPointAndPassWithContinuityCurvature',cfg.orbitTurnMode,'Smooth flythrough (recommended — flies an actual circle)')+
+        opt('toPointAndStopWithContinuityCurvature',cfg.orbitTurnMode,'Slow smooth turn, still stops at each point')+
+        opt('toPointAndStopWithDiscontinuityCurvature',cfg.orbitTurnMode,'Stop at each point (stuttering polygon, not a circle)')+
+      '</select></div>' +
+      '<div class="hint">DJI Fly\'s continuity-curvature mode flies a smooth spline through the waypoints — the only option here that actually looks and flies like a circle rather than a many-sided polygon with stop-and-rotate corners.</div>' +
       '<div class="field" style="margin-top:8px;"><label>Altitude rings (1=single ring)</label><input type="number" min="1" max="8" value="'+cfg.orbitRings+'" onchange="cfg.orbitRings=parseInt(this.value)||1;refreshEstimate();renderSetup()"></div>' +
       (cfg.orbitRings>1 ?
         '<div class="field-row">' +
@@ -2061,6 +2084,22 @@ function autoRotate(){
     if(val) val.textContent=res.rotation+'°';
     refreshEstimate();
   });
+}
+function rotateForWind(){
+  var windEl = document.getElementById('wind-dir');
+  var windDeg = parseFloat(windEl ? windEl.value : '');
+  if(isNaN(windDeg)){ alert('Enter the direction the wind is coming FROM (0-359°) first.'); return; }
+  // Coverage-path research on UAV surveys in wind finds sweeping the long
+  // passes parallel to the wind axis (not across it) covers faster with
+  // steadier ground speed than fighting a crosswind every pass. The grid's
+  // pass direction runs along bearing (90 - rotationDeg), so solving for
+  // rotationDeg that puts the pass bearing on the wind axis gives:
+  var rotation = Math.round((((90 - windDeg) % 360 + 360) % 360) * 10) / 10;
+  cfg.rotationDeg = rotation;
+  var slider=document.getElementById('rot-slider'), val=document.getElementById('rot-val');
+  if(slider) slider.value=rotation;
+  if(val) val.textContent=rotation+'°';
+  refreshEstimate();
 }
 
 // ── Drawing / mission creation ─────────────────────────────────────────────

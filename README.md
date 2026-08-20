@@ -58,7 +58,23 @@ correctly-named sub-missions on export if you ask it to.
 
 **Auto-rotation.** One button aligns the grid sweep to the polygon's longest edge
 (minimum-bounding-rectangle via rotating calipers, not a heuristic) instead of you
-dragging a slider by eye.
+dragging a slider by eye. A second button aligns it to the wind instead, if you know it:
+enter the direction the wind is coming *from* and the sweep rotates so the long passes
+run parallel to that axis rather than across it — coverage-path research on UAV surveys
+in wind (boustrophedon patterns specifically) finds that flying with/against the wind
+holds a steadier ground speed than a sweep that has to fight a crosswind on every pass.
+
+**Turn style**, per mission type, because "how the drone actually flies between
+waypoints" turns out to be its own decision, not just a byproduct of the waypoints
+themselves. DJI Fly supports stopping and rotating in place at each waypoint, or a smooth
+continuous-curvature turn (a centripetal Catmull-Rom spline through the points) that
+never fully stops. Grid/corridor missions default to stop-at-each-point, matching what
+Pix4D/UgCS/DJI Terra all recommend for photogrammetry — a spline turn keeps drifting
+gimbal position and ground speed through the corner, which is exactly what you don't want
+when every photo needs a consistent, known camera position. Orbits default the other way:
+a circular path built from stop-and-rotate segments flies a stuttering many-sided polygon
+instead of a circle, so orbit missions use the smooth spline mode by default, which is
+what actually produces a circular flight path. Both are overridable per mission type.
 
 **Map layers** — Street, Satellite, Satellite with labels, Topographic, Dark, switchable
 from a layer control, with imported layers and the flight path as separate toggleable
