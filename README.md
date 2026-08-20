@@ -102,9 +102,14 @@ shows up in the same folder afterward — no Python needed to run it from there.
 
 ## Usage
 
+The first time you open the app it asks which drone you fly — sets the right camera and
+battery defaults from that, remembers it for next time, and it stays editable later under
+Setup → Aircraft & camera (moved down near Safety & mission behaviour, since you'll rarely
+touch it again after the first run).
+
 1. Import a KML/KMZ, or draw an area/route/orbit center directly on the map.
-2. Pick your drone, camera, altitude, overlap, and (for grid missions) what you're
-   actually trying to capture — the gimbal angle and overlap follow from that.
+2. Pick altitude, overlap, and (for grid missions) what you're actually trying to
+   capture — the gimbal angle and overlap follow from that.
 3. Check the live estimate, adjust anything, generate. Fine-tune individual waypoints in
    the Waypoints tab if needed — drag markers, edit altitude/speed/gimbal per point.
 4. Export. If the mission needs more than one battery, use "Export by Battery" instead
@@ -124,12 +129,21 @@ PC, then find that mission's folder and overwrite the file inside it.
 controller — no extra driver needed beyond `pywin32`), and always asks first: it lists
 every mission slot on the controller — modified time, waypoint count, and an approximate
 location, each read straight from the mission file already sitting there — and you pick
-which one gets replaced. It does **not** guess or auto-pick the newest one for you. Worth
-knowing: DJI Fly's own mission title (the name you type when saving on the controller)
-isn't stored anywhere MTP can reach, so it can't be shown here — nobody's found where
-Android/RC2 keeps it, unlike iOS which has an accessible database for it. The upload
-dialog shows a live log of each step as it happens, so if something goes wrong you can see
-exactly where.
+which one gets replaced. It does **not** guess or auto-pick the newest one for you, and if
+the current mission needs more than one battery it warns you up front rather than
+uploading something the drone can't finish on one charge. Worth knowing: DJI Fly's own
+mission title (the name you type when saving on the controller) isn't stored anywhere MTP
+can reach, so it can't be shown here — nobody's found where Android/RC2 keeps it, unlike
+iOS which has an accessible database for it. A live green-on-black log shows each step as
+it happens, so if something goes wrong you can see exactly where.
+
+It also updates the mission's map-preview thumbnail (the little picture DJI Fly shows in
+its mission list) so it doesn't keep showing the old dummy route after you've replaced the
+mission underneath it. That's a drawn schematic of the actual route — not a screenshot of
+the app's own map — since Leaflet's tiles can't be read back into an image without the
+tile server's cooperation, and the numbered waypoint markers are HTML, which no
+screenshot approach can capture at all. The schematic still shows the real path and
+waypoint count, which is what you need to tell missions apart.
 
 **ADB does not work for this on the RC2** — its `adbd` is present but firmware-hardened to
 refuse real host connections, which is why `adb devices` shows it stuck "offline" forever

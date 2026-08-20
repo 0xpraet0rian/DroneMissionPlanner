@@ -21,7 +21,7 @@ You should have received a copy of the GNU General Public License
 along with this program.  If not, see <https://www.gnu.org/licenses/>.
 """
 
-import os, sys, math, json, time, zipfile, threading, re, tempfile, shutil
+import os, sys, math, json, time, zipfile, threading, re, tempfile, shutil, base64
 import xml.etree.ElementTree as ET
 import webview
 
@@ -1016,6 +1016,43 @@ def upload_kmz_to_slot(local_kmz_path, target_uuid, device_name_hint='DJI', prog
         )
     return target_uuid
 
+def upload_preview_to_slot(local_jpg_path, target_uuid, device_name_hint='DJI', progress=None):
+    """Replace the mission's map-preview thumbnail — a sibling structure to the
+    mission itself: waypoint/map_preview/<uuid>/<uuid>.jpg. Not every DJI Fly
+    version necessarily has this folder, so failures here are meant to be caught
+    and treated as non-fatal by the caller — the mission file is what matters,
+    a stale thumbnail is just cosmetic."""
+    def report(msg):
+        if progress:
+            progress(msg)
+    shell = _shell_app()
+    waypoint_folder = find_waypoint_folder(shell, device_name_hint)
+    preview_root, siblings = _descend(shell, waypoint_folder, 'map_preview')
+    if preview_root is None:
+        raise RuntimeError('No "map_preview" folder next to waypoint/ — found: '
+                            + (', '.join(siblings) or 'nothing'))
+    preview_folder, _ = _descend(shell, preview_root, target_uuid)
+    if preview_folder is None:
+        raise RuntimeError(f'No preview folder for mission {target_uuid}.')
+
+    report('Updating the map preview thumbnail...')
+    tmp_dir = tempfile.mkdtemp(prefix='dmp_preview_')
+    try:
+        tmp_path = os.path.join(tmp_dir, f'{target_uuid}.jpg')
+        shutil.copy(local_jpg_path, tmp_path)
+        try:
+            existing = preview_folder.ParseName(f'{target_uuid}.jpg')
+            if existing is not None:
+                existing.InvokeVerb('delete')
+                time.sleep(0.5)
+        except Exception:
+            pass
+        FOF_SILENT, FOF_NOCONFIRMATION, FOF_NOERRORUI = 4, 16, 512
+        preview_folder.CopyHere(tmp_path, FOF_SILENT | FOF_NOCONFIRMATION | FOF_NOERRORUI)
+        time.sleep(1.0)
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
 # ── Python API exposed to JS ─────────────────────────────────────────────────
 
 class Api:
@@ -1178,7 +1215,7 @@ class Api:
             self._live_log(str(e), is_err=True)
             return {'ok': False, 'msg': str(e), 'log': log}
 
-    def upload_to_rc_slot(self, cfg, waypoints, target_uuid, device_hint='DJI'):
+    def upload_to_rc_slot(self, cfg, waypoints, target_uuid, device_hint='DJI', preview_data_url=None):
         if not waypoints:
             return {'ok': False, 'msg': 'No waypoints to upload', 'log': []}
         log = []
@@ -1190,6 +1227,17 @@ class Api:
             tmp_kmz = os.path.join(tmp_dir, 'mission.kmz')
             export_wpml_kmz(cfg, waypoints, tmp_kmz)
             uuid = upload_kmz_to_slot(tmp_kmz, target_uuid, device_hint or 'DJI', progress=report)
+
+            if preview_data_url:
+                try:
+                    _, b64data = preview_data_url.split(',', 1)
+                    tmp_jpg = os.path.join(tmp_dir, 'preview.jpg')
+                    with open(tmp_jpg, 'wb') as f:
+                        f.write(base64.b64decode(b64data))
+                    upload_preview_to_slot(tmp_jpg, uuid, device_hint or 'DJI', progress=report)
+                except Exception as e:
+                    report(f'Preview thumbnail not updated (mission itself is fine): {e}')
+
             return {'ok': True, 'msg': f'Uploaded — open the mission on the controller '
                                         f'(slot {uuid}) in DJI Fly.', 'log': log}
         except Exception as e:
@@ -1419,21 +1467,24 @@ details .details-body{padding:2px 10px 10px;}
 #progress-overlay.visible{display:flex;}
 #progress-msg{color:#ccc;font-size:12px;}
 
-#picker-overlay{position:fixed;inset:0;background:#000a;z-index:9998;display:none;
+.modal-overlay{position:fixed;inset:0;background:#000a;z-index:9998;display:none;
   align-items:center;justify-content:center;backdrop-filter:blur(2px);}
-#picker-overlay.visible{display:flex;}
-#picker-panel{width:560px;max-width:92vw;max-height:80vh;display:flex;flex-direction:column;
+.modal-overlay.visible{display:flex;}
+.modal-panel{width:560px;max-width:92vw;max-height:80vh;display:flex;flex-direction:column;
   background:var(--bg2);border:1px solid var(--orange-dim);border-radius:var(--radius);
   box-shadow:0 12px 40px #000a;}
-#picker-panel h3{padding:14px 16px;font-size:13px;color:var(--orange);border-bottom:1px solid var(--border);
+.modal-panel h3{padding:14px 16px;font-size:13px;color:var(--orange);border-bottom:1px solid var(--border);
   display:flex;align-items:center;justify-content:space-between;}
-#picker-panel h3 span.close{cursor:pointer;color:var(--text-dim);font-weight:normal;font-size:16px;}
+.modal-panel h3 span.close{cursor:pointer;color:var(--text-dim);font-weight:normal;font-size:16px;}
+#picker-battery-warn{display:none;background:#2a1400;color:var(--orange2);font-size:11.5px;
+  line-height:1.5;padding:9px 16px;border-bottom:1px solid var(--orange-dim);}
+#picker-battery-warn.visible{display:block;}
 #picker-log{background:#000;color:#3fda4f;font-family:Consolas,'Courier New',monospace;font-size:11px;
   line-height:1.6;padding:10px 14px;max-height:160px;overflow-y:auto;border-bottom:1px solid var(--border);
   display:none;white-space:pre-wrap;}
 #picker-log.visible{display:block;}
 #picker-log .err{color:#ff5c5c;}
-#picker-list{overflow-y:auto;padding:10px 16px;flex:1;}
+#picker-list,#drone-picker-list{overflow-y:auto;padding:10px 16px;flex:1;}
 .slot-row{background:var(--bg3);border:1px solid var(--border);border-radius:var(--radius-sm);
   padding:9px 11px;margin-bottom:8px;display:flex;align-items:center;gap:10px;}
 .slot-row:last-child{margin-bottom:0;}
@@ -1463,10 +1514,6 @@ details .details-body{padding:2px 10px 10px;}
     <button class="primary" onclick="importKml()">&#128193; Import KML/KMZ</button>
   </div>
   <div class="tgroup">
-    <button id="btn-draw-area" onclick="startDraw('area')" title="Draw a survey polygon">&#9723; Area</button>
-    <button id="btn-draw-route" onclick="startDraw('route')" title="Draw a corridor route">&#9646; Route</button>
-    <button id="btn-draw-orbit" onclick="startDraw('orbit')" title="Set an orbit center">&#9678; Orbit</button>
-    <button id="btn-draw-manual" onclick="startDraw('manual')" title="Click to place waypoints">&#128204; Manual</button>
     <button id="btn-finish" onclick="finishDraw()" style="display:none;">&#10003; Finish</button>
     <button id="btn-cancel" onclick="cancelDraw()" style="display:none;">&#10005; Cancel</button>
   </div>
@@ -1487,12 +1534,21 @@ details .details-body{padding:2px 10px 10px;}
 
 <div id="progress-overlay"><div id="progress-msg">Loading...</div></div>
 
-<div id="picker-overlay">
-  <div id="picker-panel">
+<div id="picker-overlay" class="modal-overlay">
+  <div class="modal-panel">
     <h3>Upload to RC <span class="close" onclick="closeUploadPicker()">&times;</span></h3>
+    <div id="picker-battery-warn"></div>
     <div id="picker-log"></div>
     <div id="picker-list"></div>
     <div id="picker-footer">Pick which mission slot on the controller gets replaced. Nothing else on the controller is touched.</div>
+  </div>
+</div>
+
+<div id="drone-picker-overlay" class="modal-overlay">
+  <div class="modal-panel">
+    <h3>Which drone do you fly? <span class="close" onclick="closeDronePicker()">&times;</span></h3>
+    <div id="drone-picker-list"></div>
+    <div id="picker-footer">Sets the right camera and battery defaults. Change this anytime under Setup &rarr; Aircraft &amp; camera.</div>
   </div>
 </div>
 
@@ -1701,10 +1757,29 @@ function init(){
   pywebview.api.get_presets().then(function(p){
     PRESETS = p;
     cfg = Object.assign({}, p.defaults);
-    renderSetup();
+    var saved = null;
+    try{ saved = localStorage.getItem('dmp_drone'); }catch(e){}
+    if(saved && PRESETS.drones[saved]){
+      setDrone(saved);
+    } else {
+      renderSetup();
+      showDronePicker();
+    }
   });
 }
 window.addEventListener('pywebviewready', init);
+
+// ── Drone picker — asked once at startup, remembered, editable anytime ─────
+function showDronePicker(){
+  var el = document.getElementById('drone-picker-list');
+  el.innerHTML = Object.keys(PRESETS.drones).map(function(k){
+    var d = PRESETS.drones[k];
+    return '<div class="slot-row"><div class="slot-info"><div>'+d.label+'</div></div>' +
+      '<button class="primary" onclick="setDrone(\''+k+'\');closeDronePicker()">Select</button></div>';
+  }).join('');
+  document.getElementById('drone-picker-overlay').classList.add('visible');
+}
+function closeDronePicker(){ document.getElementById('drone-picker-overlay').classList.remove('visible'); }
 
 // ── Tabs ───────────────────────────────────────────────────────────────────
 function showTab(name){
@@ -1791,27 +1866,6 @@ function renderSetup(){
       '<button onclick="startDraw(\'orbit\')">&#9678;<br>Orbit</button>' +
       '<button onclick="startDraw(\'manual\')">&#128204;<br>Manual</button>' +
     '</div></div>' +
-
-    // ── Aircraft & camera ──
-    '<div class="panel-section"><h4>Aircraft &amp; camera</h4>' +
-    '<div class="field"><label>Drone</label><select onchange="setDrone(this.value)">'+droneOptions()+'</select></div>' +
-    '<div class="field"><label>Camera</label><select onchange="setCamera(this.value)">'+cameraOptions()+'</select></div>' +
-    '<div class="hint">'+cameraInfoLine(cfg)+'</div>' +
-    '<details><summary>Advanced (raw WPML / sensor values)<span></span></summary><div class="details-body">' +
-      '<div class="field-row">' +
-        '<div class="field"><label>droneEnumValue</label><input type="number" value="'+cfg.droneEnumValue+'" onchange="cfg.droneEnumValue=parseInt(this.value)||0"></div>' +
-        '<div class="field"><label>droneSubEnumValue</label><input type="number" value="'+cfg.droneSubEnumValue+'" onchange="cfg.droneSubEnumValue=parseInt(this.value)||0"></div>' +
-      '</div>' +
-      '<div class="field-row">' +
-        '<div class="field"><label>Sensor width (mm)</label><input type="number" step="0.01" value="'+cfg.sensor_w+'" onchange="cfg.sensor_w=parseFloat(this.value)||1;refreshEstimate();renderSetup()"></div>' +
-        '<div class="field"><label>Sensor height (mm)</label><input type="number" step="0.01" value="'+cfg.sensor_h+'" onchange="cfg.sensor_h=parseFloat(this.value)||1;refreshEstimate();renderSetup()"></div>' +
-      '</div>' +
-      '<div class="field-row">' +
-        '<div class="field"><label>Focal length (mm)</label><input type="number" step="0.01" value="'+cfg.focal+'" onchange="cfg.focal=parseFloat(this.value)||1;refreshEstimate();renderSetup()"></div>' +
-        '<div class="field"><label>Image width (px)</label><input type="number" value="'+cfg.img_w+'" onchange="cfg.img_w=parseInt(this.value)||1;refreshEstimate()"></div>' +
-      '</div>' +
-      '<div class="field"><label>Image height (px)</label><input type="number" value="'+cfg.img_h+'" onchange="cfg.img_h=parseInt(this.value)||1;refreshEstimate()"></div>' +
-    '</div></details></div>' +
 
     // ── Core flight parameters (always visible — used by every mission type) ──
     '<div class="panel-section"><h4>Flight</h4>' +
@@ -1902,6 +1956,27 @@ function renderSetup(){
     '</div></details>' +
     '</div>' +
 
+    // ── Aircraft & camera — set once via the startup picker, rarely touched after ──
+    '<div class="panel-section"><h4>Aircraft &amp; camera</h4>' +
+    '<div class="field"><label>Drone</label><select onchange="setDrone(this.value)">'+droneOptions()+'</select></div>' +
+    '<div class="field"><label>Camera</label><select onchange="setCamera(this.value)">'+cameraOptions()+'</select></div>' +
+    '<div class="hint">'+cameraInfoLine(cfg)+'</div>' +
+    '<details><summary>Advanced (raw WPML / sensor values)<span></span></summary><div class="details-body">' +
+      '<div class="field-row">' +
+        '<div class="field"><label>droneEnumValue</label><input type="number" value="'+cfg.droneEnumValue+'" onchange="cfg.droneEnumValue=parseInt(this.value)||0"></div>' +
+        '<div class="field"><label>droneSubEnumValue</label><input type="number" value="'+cfg.droneSubEnumValue+'" onchange="cfg.droneSubEnumValue=parseInt(this.value)||0"></div>' +
+      '</div>' +
+      '<div class="field-row">' +
+        '<div class="field"><label>Sensor width (mm)</label><input type="number" step="0.01" value="'+cfg.sensor_w+'" onchange="cfg.sensor_w=parseFloat(this.value)||1;refreshEstimate();renderSetup()"></div>' +
+        '<div class="field"><label>Sensor height (mm)</label><input type="number" step="0.01" value="'+cfg.sensor_h+'" onchange="cfg.sensor_h=parseFloat(this.value)||1;refreshEstimate();renderSetup()"></div>' +
+      '</div>' +
+      '<div class="field-row">' +
+        '<div class="field"><label>Focal length (mm)</label><input type="number" step="0.01" value="'+cfg.focal+'" onchange="cfg.focal=parseFloat(this.value)||1;refreshEstimate();renderSetup()"></div>' +
+        '<div class="field"><label>Image width (px)</label><input type="number" value="'+cfg.img_w+'" onchange="cfg.img_w=parseInt(this.value)||1;refreshEstimate()"></div>' +
+      '</div>' +
+      '<div class="field"><label>Image height (px)</label><input type="number" value="'+cfg.img_h+'" onchange="cfg.img_h=parseInt(this.value)||1;refreshEstimate()"></div>' +
+    '</div></details></div>' +
+
     // ── Safety & mission behaviour — sane defaults, rarely touched ──
     '<details style="margin:0;"><summary>&#9881; Safety &amp; mission behaviour<span></span></summary><div class="details-body">' +
       '<div class="field"><label>Fly-to-first-waypoint mode</label><select onchange="cfg.flyToWaylineMode=this.value">' +
@@ -1926,6 +2001,7 @@ function setDrone(k){
   cfg.drone=k; var d=PRESETS.drones[k];
   cfg.droneEnumValue=d.droneEnumValue; cfg.droneSubEnumValue=d.droneSubEnumValue;
   if(d.batteries && d.batteries.length){ cfg.batteryIdx=0; cfg.batteryMinutes=d.batteries[0].minutes; }
+  try{ localStorage.setItem('dmp_drone', k); }catch(e){}
   if(d.defaultCamera) setCamera(d.defaultCamera); else renderSetup();
 }
 function setCamera(k){
@@ -1976,22 +2052,20 @@ function startDraw(mode){
   promptMissionName();
   drawMode = mode; tempPoints = [];
   tempGroup.clearLayers();
-  document.querySelectorAll('#btn-draw-area,#btn-draw-route,#btn-draw-orbit,#btn-draw-manual').forEach(b=>b.classList.remove('active'));
   var hint = document.getElementById('draw-hint');
   hint.classList.add('visible');
   document.getElementById('btn-finish').style.display = (mode==='orbit'||mode==='manual') ? 'none' : 'inline-block';
   document.getElementById('btn-cancel').style.display = 'inline-block';
   var snapNote = importedLayers.length ? ' Clicks near an imported line/point snap to it.' : '';
-  if(mode==='area'){ document.getElementById('btn-draw-area').classList.add('active'); hint.textContent='Click to add area corners (min. 3). Click "Finish" when done.'+snapNote; }
-  if(mode==='route'){ document.getElementById('btn-draw-route').classList.add('active'); hint.textContent='Click to add route points (min. 2). Click "Finish" when done.'+snapNote; }
-  if(mode==='orbit'){ document.getElementById('btn-draw-orbit').classList.add('active'); hint.textContent='Click on the map to place the orbit center.'+snapNote; }
-  if(mode==='manual'){ document.getElementById('btn-draw-manual').classList.add('active'); hint.textContent='Click to add waypoints. Click "Cancel" or switch tools to stop.'+snapNote; }
+  if(mode==='area') hint.textContent='Click to add area corners (min. 3). Click "Finish" when done.'+snapNote;
+  if(mode==='route') hint.textContent='Click to add route points (min. 2). Click "Finish" when done.'+snapNote;
+  if(mode==='orbit') hint.textContent='Click on the map to place the orbit center.'+snapNote;
+  if(mode==='manual') hint.textContent='Click to add waypoints. Click "Cancel" or switch tools to stop.'+snapNote;
 }
 function cancelDraw(){
   drawMode = null; tempPoints = [];
   tempGroup.clearLayers();
   snapGroup.clearLayers();
-  document.querySelectorAll('#btn-draw-area,#btn-draw-route,#btn-draw-orbit,#btn-draw-manual').forEach(b=>b.classList.remove('active'));
   document.getElementById('draw-hint').classList.remove('visible');
   document.getElementById('btn-finish').style.display='none';
   document.getElementById('btn-cancel').style.display='none';
@@ -2434,13 +2508,18 @@ function droneSlug(){
   var label = d ? d.label : (cfg.drone||'drone');
   return label.replace(/^DJI\s+/i,'').trim().toLowerCase().replace(/[^a-z0-9]+/g,'_').replace(/^_+|_+$/g,'');
 }
+function timestampTag(){
+  var d = new Date();
+  var pad = n => String(n).padStart(2,'0');
+  return d.getFullYear()+pad(d.getMonth()+1)+pad(d.getDate())+'-'+pad(d.getHours())+pad(d.getMinutes());
+}
 function buildExportFilename(wps){
   var dist=0;
   for(var i=1;i<wps.length;i++) dist+=haversine(wps[i-1].lat,wps[i-1].lon,wps[i].lat,wps[i].lon);
   var flightSec = dist/(cfg.speed||5) + wps.reduce((s,w)=>s+(w.hover||0),0);
   var mins=Math.floor(flightSec/60), secs=Math.round(flightSec%60);
   var photoCount = wps.filter(w=>w.photo).length;
-  return sanitizeMissionName(missionName)+'_'+mins+'m'+secs+'s_'+photoCount+'p_'+droneSlug();
+  return sanitizeMissionName(missionName)+'_'+timestampTag()+'_'+mins+'m'+secs+'s_'+photoCount+'p_'+droneSlug();
 }
 function exportWpml(){
   if(waypoints.length===0){ alert('No waypoints in the current mission.'); return; }
@@ -2460,6 +2539,61 @@ function exportWpmlSplit(){
     if(!res.ok && res.msg!=='Cancelled') alert(res.msg);
   });
 }
+// Draws a schematic route preview (not a real map screenshot — Leaflet's raster
+// tiles can't be read back into a canvas without the tile server sending
+// permissive CORS headers, and the numbered waypoint markers are HTML divIcons,
+// which no canvas-capture approach can rasterize at all). This is deliberately
+// self-contained instead: fast, no CORS dependency, and still shows the actual
+// route/waypoint count, which is the part that matters for picking a mission
+// out in DJI Fly's list.
+function buildPreviewImageDataUrl(wps){
+  if(!wps || !wps.length) return null;
+  var W=800, H=600, pad=70;
+  var canvas=document.createElement('canvas');
+  canvas.width=W; canvas.height=H;
+  var ctx=canvas.getContext('2d');
+  ctx.fillStyle='#eee6d6'; ctx.fillRect(0,0,W,H);
+  ctx.strokeStyle='#ddd2ba'; ctx.lineWidth=1;
+  for(var gx=0; gx<W; gx+=40){ ctx.beginPath(); ctx.moveTo(gx,0); ctx.lineTo(gx,H); ctx.stroke(); }
+  for(var gy=0; gy<H; gy+=40){ ctx.beginPath(); ctx.moveTo(0,gy); ctx.lineTo(W,gy); ctx.stroke(); }
+
+  var lats=wps.map(w=>w.lat), lons=wps.map(w=>w.lon);
+  var minLat=Math.min.apply(null,lats), maxLat=Math.max.apply(null,lats);
+  var minLon=Math.min.apply(null,lons), maxLon=Math.max.apply(null,lons);
+  var cosLat=Math.cos((minLat+maxLat)/2*Math.PI/180);
+  var spanX=Math.max((maxLon-minLon)*cosLat, 1e-7), spanY=Math.max(maxLat-minLat, 1e-7);
+  var scale=Math.min((W-2*pad)/spanX, (H-2*pad)/spanY);
+  function project(lat,lon){
+    var x = W/2 + (lon-(minLon+maxLon)/2)*cosLat*scale;
+    var y = H/2 - (lat-(minLat+maxLat)/2)*scale;
+    return [x,y];
+  }
+
+  ctx.strokeStyle='#e07b00'; ctx.lineWidth=3; ctx.lineJoin='round';
+  ctx.beginPath();
+  wps.forEach(function(w,i){ var p=project(w.lat,w.lon); if(i===0) ctx.moveTo(p[0],p[1]); else ctx.lineTo(p[0],p[1]); });
+  ctx.stroke();
+
+  var dense = wps.length > 25;
+  wps.forEach(function(w,i){
+    var p=project(w.lat,w.lon);
+    var color = i===0 ? '#3fae4b' : (i===wps.length-1 ? '#c0392b' : '#e07b00');
+    var r = dense ? 4 : 14;
+    ctx.beginPath(); ctx.arc(p[0],p[1],r,0,Math.PI*2);
+    ctx.fillStyle=color; ctx.fill(); ctx.lineWidth=2; ctx.strokeStyle='#000'; ctx.stroke();
+    if(!dense){
+      ctx.fillStyle='#000'; ctx.font='bold 12px sans-serif'; ctx.textAlign='center'; ctx.textBaseline='middle';
+      ctx.fillText(String(i+1), p[0], p[1]);
+    }
+  });
+
+  ctx.fillStyle='#000c'; ctx.fillRect(0,H-30,W,30);
+  ctx.fillStyle='#fff'; ctx.font='13px sans-serif'; ctx.textAlign='left'; ctx.textBaseline='middle';
+  ctx.fillText((missionName||'Mission')+' — '+wps.length+' waypoints', 12, H-15);
+
+  return canvas.toDataURL('image/jpeg', 0.85);
+}
+
 // ── Upload to RC — slot picker + live terminal-style log ────────────────────
 // The log lines shown here come live from Python via evaluate_js as each step
 // happens (device lookup, per-slot reads, delete, copy, verify) — not just a
@@ -2474,11 +2608,29 @@ function appendUploadLog(msg, isErr){
   log.appendChild(line);
   log.scrollTop = log.scrollHeight;
 }
+function currentMissionBatteries(){
+  var dist=0;
+  for(var i=1;i<waypoints.length;i++) dist+=haversine(waypoints[i-1].lat,waypoints[i-1].lon,waypoints[i].lat,waypoints[i].lon);
+  var flightSec = dist/(cfg.speed||5) + waypoints.reduce((s,w)=>s+(w.hover||0),0);
+  var usableSec = usableBatteryMinutes(cfg)*60;
+  return {minutes: flightSec/60, batteries: Math.max(1, Math.ceil(flightSec/usableSec))};
+}
 function openUploadPicker(){
   if(waypoints.length===0){ alert('No waypoints in the current mission.'); return; }
   document.getElementById('picker-overlay').classList.add('visible');
   document.getElementById('picker-log').innerHTML=''; document.getElementById('picker-log').classList.remove('visible');
   document.getElementById('picker-list').innerHTML='<div class="empty-hint">Scanning the controller...</div>';
+  var battInfo = currentMissionBatteries();
+  var warnEl = document.getElementById('picker-battery-warn');
+  if(battInfo.batteries>1){
+    warnEl.classList.add('visible');
+    warnEl.innerHTML = '&#9888; This mission is ~'+Math.round(battInfo.minutes)+' min &mdash; needs about <b>'+battInfo.batteries+
+      '</b> batteries. Uploading it as-is to one slot means the drone can\'t finish it on a single charge. '+
+      'Close this and use <b>Export by Battery</b> instead to split it into '+battInfo.batteries+
+      ' separate missions, then upload each one to its own slot.';
+  } else {
+    warnEl.classList.remove('visible'); warnEl.innerHTML='';
+  }
   pywebview.api.list_rc_missions().then(function(res){
     if(!res.ok){
       document.getElementById('picker-list').innerHTML =
@@ -2512,7 +2664,8 @@ function confirmUploadToSlot(uuid){
   if(!confirm('Overwrite mission slot '+uuid.slice(0,8)+'... on the controller with the current mission? This cannot be undone.')) return;
   document.getElementById('picker-list').innerHTML='';
   document.getElementById('picker-log').innerHTML=''; document.getElementById('picker-log').classList.add('visible');
-  pywebview.api.upload_to_rc_slot(cfg, waypoints, uuid).then(function(res){
+  var previewUrl = buildPreviewImageDataUrl(waypoints);
+  pywebview.api.upload_to_rc_slot(cfg, waypoints, uuid, 'DJI', previewUrl).then(function(res){
     setStatus(res.msg);
     if(res.ok){
       appendUploadLog('Done. '+res.msg);
