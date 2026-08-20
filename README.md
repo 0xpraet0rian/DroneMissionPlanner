@@ -90,9 +90,12 @@ later, or reuse a site's setup for a repeat survey.
 **Run from source:**
 
 ```bash
-pip install pywebview
+pip install pywebview pywin32
 python mission_planner.py
 ```
+
+(`pywin32` is only needed for the "Upload to RC" button — the app runs fine without it,
+that one button just won't work.)
 
 **Or build a standalone EXE:** double-click `BUILD_EXE.bat`. `DroneMissionPlanner.exe`
 shows up in the same folder afterward — no Python needed to run it from there.
@@ -105,18 +108,32 @@ shows up in the same folder afterward — no Python needed to run it from there.
 3. Check the live estimate, adjust anything, generate. Fine-tune individual waypoints in
    the Waypoints tab if needed — drag markers, edit altitude/speed/gimbal per point.
 4. Export. If the mission needs more than one battery, use "Export by Battery" instead
-   of the plain export to get it split automatically.
-5. Get the file onto your RC — see the note below, it's not a simple drag-and-drop.
+   of the plain export to get it split automatically. Or skip exporting a file at all and
+   hit **Upload to RC** to push the current mission straight to a connected controller.
+5. If Upload to RC doesn't work for some reason, see the manual method below — it's not a
+   simple drag-and-drop, DJI Fly is picky about this.
 
 ### Getting a mission onto a DJI RC / RC2
 
 DJI Fly won't pick up an arbitrary KMZ dropped into its file system; it only recognizes
-missions it created itself. The workaround that actually works: create a throwaway
-waypoint mission in DJI Fly on the controller, connect the RC to your PC over USB
-(`This PC \ DJI RC 2 \ Internal shared storage \ Android \ data \ dji.go.v5 \ files \
-waypoint`), find the newest subfolder — it's named with a GUID, and contains a `.kmz`
-file sharing that same GUID as its filename — rename your exported mission to match that
-exact filename, and overwrite it. Reopen the mission in DJI Fly and it loads your real
+missions it created itself. The trick — same one **Upload to RC** automates — is: create
+a throwaway waypoint mission in DJI Fly on the controller first, connect the RC to your
+PC, then find that mission's folder and overwrite the file inside it.
+
+**Upload to RC** does this over MTP (the same way Windows Explorer talks to the
+controller — no extra driver needed beyond `pywin32`). **ADB does not work for this on
+the RC2** — its `adbd` is present but firmware-hardened to refuse real host connections,
+which is why `adb devices` shows it stuck "offline" forever no matter what you try with
+cables, drivers, or developer-options toggling. That's confirmed by independent
+reverse-engineering of the RC2, not a driver problem on your end, so don't waste time
+chasing an ADB fix here.
+
+If the automatic upload fails, or you don't have `pywin32` installed, do it by hand:
+connect over USB, browse to
+`This PC \ DJI RC 2 \ Internal shared storage \ Android \ data \ dji.go.v5 \ files \
+waypoint`, find the newest subfolder — it's named with a GUID, and contains a `.kmz` file
+sharing that same GUID as its filename — rename your exported mission to match that exact
+filename, and overwrite it. Reopen the mission in DJI Fly and it loads your real
 waypoints instead of the dummy ones.
 
 Also: don't edit or re-save a mission from inside DJI Fly after importing it — it can

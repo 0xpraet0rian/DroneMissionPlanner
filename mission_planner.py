@@ -21,7 +21,7 @@ You should have received a copy of the GNU General Public License
 along with this program.  If not, see <https://www.gnu.org/licenses/>.
 """
 
-import os, sys, math, json, time, zipfile, threading, re
+import os, sys, math, json, time, zipfile, threading, re, tempfile, shutil
 import xml.etree.ElementTree as ET
 import webview
 
@@ -800,6 +800,129 @@ def export_wpml_kmz(cfg, waypoints, out_path):
         z.writestr('wpmz/template.kml', tkml)
         z.writestr('wpmz/waylines.wpml', wpml)
 
+# ── Upload straight to a DJI RC over MTP ─────────────────────────────────────
+# ADB is not a real option on the RC2: independent reverse-engineering (see
+# docs.f1y.ing's RC2 research notes) confirms adbd is present but deliberately
+# refuses host handshakes as a firmware hardening measure — that's why it shows
+# "offline" forever, not "unauthorized" or missing. No driver/cable/settings fix
+# changes that. MTP is what DJI actually supports, so that's what this drives,
+# via the same Shell.Application COM automation Windows Explorer itself uses to
+# browse MTP devices — no extra driver or library needed beyond pywin32.
+#
+# DJI Fly only ever loads a mission it created itself, so the trick (same one
+# DJI-KMZ-Injector's own ADB backend uses) is: a dummy mission already exists on
+# the controller as a UUID-named folder containing "<uuid>.kmz"; find the newest
+# one and overwrite that file in place.
+
+WAYPOINT_MTP_PATH = ['Internal shared storage', 'Android', 'data', 'dji.go.v5', 'files', 'waypoint']
+_UUID_RE = re.compile(r'^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$')
+
+def _shell_app():
+    import win32com.client
+    return win32com.client.Dispatch('Shell.Application')
+
+def _find_device_folder(shell, name_hint):
+    computer = shell.NameSpace(17)  # CSIDL_DRIVES, i.e. "This PC"
+    if computer is None:
+        raise RuntimeError('Could not access "This PC" via the Windows Shell.')
+    seen = []
+    for item in computer.Items():
+        seen.append(item.Name)
+        if name_hint.lower() in item.Name.lower():
+            return shell.NameSpace(item), item.Name
+    raise RuntimeError(
+        f'No device with "{name_hint}" in its name under This PC. Found: '
+        + (', '.join(seen) or '(nothing — is the controller connected, unlocked, and awake?)')
+    )
+
+def _descend(shell, folder, name):
+    if folder is None:
+        return None, []
+    seen = []
+    for item in folder.Items():
+        seen.append(item.Name)
+        if item.Name.lower() == name.lower():
+            return shell.NameSpace(item), seen
+    return None, seen
+
+def find_waypoint_folder(shell, device_name_hint):
+    folder, found_name = _find_device_folder(shell, device_name_hint)
+    trail = [found_name]
+    for step in WAYPOINT_MTP_PATH:
+        folder, siblings = _descend(shell, folder, step)
+        if folder is None:
+            raise RuntimeError(
+                f'Could not find "{step}" inside {" > ".join(trail)}. Found instead: '
+                + (', '.join(siblings) or '(empty)')
+            )
+        trail.append(step)
+    return folder
+
+def find_latest_mission_uuid(waypoint_folder):
+    missions = []
+    for item in waypoint_folder.Items():
+        if _UUID_RE.match(item.Name):
+            try:
+                mod = item.ModifyDate
+            except Exception:
+                mod = ''
+            missions.append((item.Name, mod))
+    if not missions:
+        raise RuntimeError(
+            'No mission folders under waypoint/. Create a throwaway waypoint mission '
+            'in DJI Fly on the controller first, then try again.'
+        )
+    missions.sort(key=lambda m: m[1], reverse=True)
+    return missions[0][0]
+
+def upload_kmz_via_mtp(local_kmz_path, device_name_hint='DJI', progress=None):
+    def report(msg):
+        if progress:
+            progress(msg)
+    try:
+        import win32com.client  # noqa: F401
+    except ImportError:
+        raise RuntimeError('pywin32 is required for this — install with: pip install pywin32')
+
+    shell = _shell_app()
+    report('Looking for the controller...')
+    waypoint_folder = find_waypoint_folder(shell, device_name_hint)
+    report('Finding the newest mission slot...')
+    uuid = find_latest_mission_uuid(waypoint_folder)
+    mission_folder, _ = _descend(shell, waypoint_folder, uuid)
+    if mission_folder is None:
+        raise RuntimeError(f'Mission folder {uuid} disappeared mid-operation.')
+
+    tmp_dir = tempfile.mkdtemp(prefix='dmp_mtp_')
+    try:
+        tmp_path = os.path.join(tmp_dir, f'{uuid}.kmz')
+        shutil.copy(local_kmz_path, tmp_path)
+
+        report(f'Removing the old mission file ({uuid}.kmz)...')
+        try:
+            existing = mission_folder.ParseName(f'{uuid}.kmz')
+            if existing is not None:
+                existing.InvokeVerb('delete')
+                time.sleep(0.5)
+        except Exception:
+            pass  # best-effort; the copy below still tries to overwrite
+
+        report('Uploading...')
+        FOF_SILENT, FOF_NOCONFIRMATION, FOF_NOERRORUI = 4, 16, 512
+        mission_folder.CopyHere(tmp_path, FOF_SILENT | FOF_NOCONFIRMATION | FOF_NOERRORUI)
+        time.sleep(1.0)
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    report('Verifying...')
+    found = any(item.Name.lower() == f'{uuid}.kmz'.lower() for item in mission_folder.Items())
+    if not found:
+        raise RuntimeError(
+            'Upload finished but the file was not found afterward — the MTP copy may '
+            'have silently failed. Check the mission on the controller before flying.'
+        )
+    return uuid
+
 # ── Python API exposed to JS ─────────────────────────────────────────────────
 
 class Api:
@@ -939,6 +1062,22 @@ class Api:
                                         + ', '.join(written)}
         except Exception as e:
             return {'ok': False, 'msg': str(e)}
+
+    def upload_to_rc(self, cfg, waypoints, device_hint='DJI'):
+        if not waypoints:
+            return {'ok': False, 'msg': 'No waypoints to upload', 'log': []}
+        log = []
+        tmp_dir = tempfile.mkdtemp(prefix='dmp_upload_')
+        try:
+            tmp_kmz = os.path.join(tmp_dir, 'mission.kmz')
+            export_wpml_kmz(cfg, waypoints, tmp_kmz)
+            uuid = upload_kmz_via_mtp(tmp_kmz, device_hint or 'DJI', progress=log.append)
+            return {'ok': True, 'msg': f'Uploaded — open the mission on the controller '
+                                        f'(slot {uuid}) in DJI Fly.', 'log': log}
+        except Exception as e:
+            return {'ok': False, 'msg': str(e), 'log': log}
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
 
     # ── Project save/load ──
     def save_project(self, project_json):
@@ -1194,6 +1333,7 @@ details .details-body{padding:2px 10px 10px;}
     <button onclick="clearMission()">&#128465; Clear</button>
     <button class="primary" onclick="exportWpml()">&#128190; Export WPML</button>
     <button onclick="exportWpmlSplit()" title="Split into multiple missions sized to your battery's usable endurance">&#128267; Export by Battery</button>
+    <button onclick="uploadToRc()" title="Push straight to a connected DJI RC/RC2 over MTP — no manual file juggling">&#128225; Upload to RC</button>
   </div>
   <div class="sep"></div>
   <div class="tgroup">
@@ -2167,6 +2307,22 @@ function exportWpmlSplit(){
     hideProgress();
     setStatus(res.msg);
     if(!res.ok && res.msg!=='Cancelled') alert(res.msg);
+  });
+}
+function uploadToRc(){
+  if(waypoints.length===0){ alert('No waypoints in the current mission.'); return; }
+  showProgress('Connecting to the controller over MTP...');
+  pywebview.api.upload_to_rc(cfg, waypoints).then(function(res){
+    hideProgress();
+    setStatus(res.msg);
+    if(!res.ok){
+      var steps = (res.log && res.log.length) ? '\n\nSteps completed before the failure:\n- '+res.log.join('\n- ') : '';
+      alert('Upload failed: '+res.msg+steps+
+        '\n\nADB does not work on the RC2 (deliberately blocked in firmware) — this only '+
+        'uses MTP. If it keeps failing, fall back to the manual method in the README '+
+        '(rename the exported KMZ to match the newest mission folder\'s UUID and copy it '+
+        'in via Explorer).');
+    }
   });
 }
 function saveProject(){
