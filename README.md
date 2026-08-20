@@ -137,13 +137,24 @@ can reach, so it can't be shown here — nobody's found where Android/RC2 keeps 
 iOS which has an accessible database for it. A live green-on-black log shows each step as
 it happens, so if something goes wrong you can see exactly where.
 
-It also updates the mission's map-preview thumbnail (the little picture DJI Fly shows in
-its mission list) so it doesn't keep showing the old dummy route after you've replaced the
-mission underneath it. That's a drawn schematic of the actual route — not a screenshot of
-the app's own map — since Leaflet's tiles can't be read back into an image without the
-tile server's cooperation, and the numbered waypoint markers are HTML, which no
-screenshot approach can capture at all. The schematic still shows the real path and
-waypoint count, which is what you need to tell missions apart.
+It also replaces the mission's map-preview thumbnail on the controller (`waypoint/
+map_preview/<uuid>/<uuid>.jpg`) with a drawn schematic of the actual route — not a
+screenshot of the app's own map, since Leaflet's tiles can't be read back into an image
+without the tile server's cooperation, and the waypoint markers are HTML, which no
+screenshot approach can capture at all. The replace is verified byte-for-byte (not just
+"did a copy command run") and specifically checks for a known MTP failure mode where a
+delete that hasn't fully propagated causes the device to silently create a renamed
+duplicate instead of overwriting — if that happens you'll get a clear error instead of a
+silent no-op.
+
+Even when the file replace is fully verified, though: **DJI Fly's mission-*list* view
+appears to cache the thumbnail independent of the file on disk**, and doesn't reliably
+notice an external file replace. It does correctly regenerate the thumbnail from the
+mission's actual content the moment you open that mission in the waypoint editor, so the
+real content is never wrong — it's specifically the *list* thumbnail, before you've
+opened the mission, that can lag. If it's still showing the old picture, that's DJI Fly's
+own app-level cache, not a failed upload — opening the mission, restarting DJI Fly, or
+rebooting the controller forces it to catch up.
 
 **ADB does not work for this on the RC2** — its `adbd` is present but firmware-hardened to
 refuse real host connections, which is why `adb devices` shows it stuck "offline" forever

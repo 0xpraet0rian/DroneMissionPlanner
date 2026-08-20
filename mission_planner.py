@@ -968,6 +968,53 @@ def list_mission_slots(device_name_hint='DJI', progress=None):
         shutil.rmtree(tmp_dir, ignore_errors=True)
     return results
 
+def _replace_file_in_mtp_folder(folder, filename, local_path, report):
+    """Delete <filename> in an MTP folder if present, verifying it's actually
+    gone before copying the replacement in, then verify the copy landed under
+    the exact same name rather than MTP silently creating a renamed duplicate
+    (e.g. "name (1).jpg") when a delete hadn't fully propagated yet — a known
+    MTP failure mode that looks like nothing happened even though the upload
+    "succeeded". Raises with a specific, actionable message if that happened."""
+    existing = folder.ParseName(filename)
+    if existing is not None:
+        report(f'Removing the old {filename}...')
+        try:
+            existing.InvokeVerb('delete')
+        except Exception:
+            pass
+        for _ in range(20):  # up to ~4s, polling rather than a blind fixed sleep
+            if folder.ParseName(filename) is None:
+                break
+            time.sleep(0.2)
+        else:
+            report(f'Warning: {filename} may not have actually been removed before uploading.')
+
+    report(f'Uploading {filename}...')
+    FOF_SILENT, FOF_NOCONFIRMATION, FOF_NOERRORUI = 4, 16, 512
+    folder.CopyHere(local_path, FOF_SILENT | FOF_NOCONFIRMATION | FOF_NOERRORUI)
+
+    target = None
+    for _ in range(30):  # up to ~6s
+        target = folder.ParseName(filename)
+        if target is not None:
+            break
+        time.sleep(0.2)
+    if target is None:
+        raise RuntimeError(
+            f'{filename} was not found after uploading — the MTP copy likely failed silently.'
+        )
+
+    stem = os.path.splitext(filename)[0]
+    dupes = [item.Name for item in folder.Items()
+             if item.Name != filename and item.Name.lower().startswith(stem.lower() + ' (')]
+    if dupes:
+        raise RuntimeError(
+            f'The device created a renamed copy ({dupes[0]}) instead of overwriting '
+            f'{filename} — the old file is still what DJI Fly is using. This is a known MTP '
+            'quirk when a delete hasn\'t fully propagated; try again, or reboot the '
+            'controller and retry.'
+        )
+
 def upload_kmz_to_slot(local_kmz_path, target_uuid, device_name_hint='DJI', progress=None):
     def report(msg):
         if progress:
@@ -990,38 +1037,24 @@ def upload_kmz_to_slot(local_kmz_path, target_uuid, device_name_hint='DJI', prog
     try:
         tmp_path = os.path.join(tmp_dir, f'{target_uuid}.kmz')
         shutil.copy(local_kmz_path, tmp_path)
-
-        report(f'Removing the old mission file ({target_uuid}.kmz)...')
-        try:
-            existing = mission_folder.ParseName(f'{target_uuid}.kmz')
-            if existing is not None:
-                existing.InvokeVerb('delete')
-                time.sleep(0.5)
-        except Exception:
-            pass  # best-effort; the copy below still tries to overwrite
-
-        report('Uploading...')
-        FOF_SILENT, FOF_NOCONFIRMATION, FOF_NOERRORUI = 4, 16, 512
-        mission_folder.CopyHere(tmp_path, FOF_SILENT | FOF_NOCONFIRMATION | FOF_NOERRORUI)
-        time.sleep(1.0)
+        _replace_file_in_mtp_folder(mission_folder, f'{target_uuid}.kmz', tmp_path, report)
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
-
-    report('Verifying...')
-    found = any(item.Name.lower() == f'{target_uuid}.kmz'.lower() for item in mission_folder.Items())
-    if not found:
-        raise RuntimeError(
-            'Upload finished but the file was not found afterward — the MTP copy may '
-            'have silently failed. Check the mission on the controller before flying.'
-        )
     return target_uuid
 
 def upload_preview_to_slot(local_jpg_path, target_uuid, device_name_hint='DJI', progress=None):
     """Replace the mission's map-preview thumbnail — a sibling structure to the
     mission itself: waypoint/map_preview/<uuid>/<uuid>.jpg. Not every DJI Fly
     version necessarily has this folder, so failures here are meant to be caught
-    and treated as non-fatal by the caller — the mission file is what matters,
-    a stale thumbnail is just cosmetic."""
+    and treated as non-fatal by the caller.
+
+    Worth knowing even when the file replace verifiably succeeds: DJI Fly's
+    mission-*list* view appears to cache the thumbnail bitmap independent of the
+    file on disk (it only visibly regenerates the thumbnail when you actually
+    open a mission in the waypoint editor), so a raw file overwrite from outside
+    the app may not show up in the list without DJI Fly itself re-scanning —
+    opening the mission, restarting DJI Fly, or rebooting the controller forces
+    that. The mission content itself (the kmz) is unaffected by this either way."""
     def report(msg):
         if progress:
             progress(msg)
@@ -1035,23 +1068,15 @@ def upload_preview_to_slot(local_jpg_path, target_uuid, device_name_hint='DJI', 
     if preview_folder is None:
         raise RuntimeError(f'No preview folder for mission {target_uuid}.')
 
-    report('Updating the map preview thumbnail...')
     tmp_dir = tempfile.mkdtemp(prefix='dmp_preview_')
     try:
         tmp_path = os.path.join(tmp_dir, f'{target_uuid}.jpg')
         shutil.copy(local_jpg_path, tmp_path)
-        try:
-            existing = preview_folder.ParseName(f'{target_uuid}.jpg')
-            if existing is not None:
-                existing.InvokeVerb('delete')
-                time.sleep(0.5)
-        except Exception:
-            pass
-        FOF_SILENT, FOF_NOCONFIRMATION, FOF_NOERRORUI = 4, 16, 512
-        preview_folder.CopyHere(tmp_path, FOF_SILENT | FOF_NOCONFIRMATION | FOF_NOERRORUI)
-        time.sleep(1.0)
+        _replace_file_in_mtp_folder(preview_folder, f'{target_uuid}.jpg', tmp_path, report)
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
+    report('Preview file replaced on the controller (the mission LIST thumbnail may still show '
+           'the old one until you open the mission or restart DJI Fly — see note above).')
 
 # ── Python API exposed to JS ─────────────────────────────────────────────────
 
