@@ -1541,6 +1541,10 @@ button:disabled{opacity:.35;cursor:default;}
 .hint{font-size:10.5px;color:var(--text-dim);line-height:1.5;margin-top:5px;}
 .hint.warn{color:var(--orange2);}
 .hint b{color:var(--text);}
+.help-icon{display:inline-flex;align-items:center;justify-content:center;width:14px;height:14px;
+  border-radius:50%;background:var(--bg4);color:var(--text-faint);font-size:9px;font-weight:700;
+  cursor:help;margin-left:5px;vertical-align:middle;border:1px solid var(--border2);flex-shrink:0;}
+.help-icon:hover{background:var(--orange-dim);color:#fff;border-color:var(--orange);}
 
 /* ── Collapsible groups ── */
 details{border:1px solid var(--border);border-radius:var(--radius-sm);margin-bottom:8px;
@@ -2079,33 +2083,26 @@ function renderSetup(){
       '<div class="field"><label>Altitude (m AGL)</label><input type="number" value="'+cfg.altitude+'" onchange="cfg.altitude=parseFloat(this.value)||10;refreshEstimate()"></div>' +
       '<div class="field"><label>Speed (m/s)</label><input type="number" value="'+cfg.speed+'" onchange="cfg.speed=parseFloat(this.value)||1"></div>' +
     '</div>' +
-    '<div class="field"><label>Delay at each waypoint (sec, 0=none)</label><input type="number" min="0" value="'+cfg.delayAtWaypoint+'" onchange="cfg.delayAtWaypoint=parseFloat(this.value)||0"></div>' +
-    '<div class="hint">The aircraft moves on once it considers the photo action done, which in real-world reports is roughly '+
-      '"shutter fired," not "confirmed written to the card" &mdash; on a slow card, or shooting RAW/DNG, that can mean a '+
-      'skipped photo the mission never notices. If you\'re seeing gaps, this delay is the fix: 1-2s is usually enough for '+
-      'JPEG on a fast card, several seconds for RAW on a slow one.</div>' +
+    '<div class="field"><label>Delay at each waypoint (sec, 0=none)'+help('The aircraft moves on once it considers the photo action done, which in real-world reports is roughly "shutter fired," not "confirmed written to the card" -- on a slow card, or shooting RAW/DNG, that can mean a skipped photo the mission never notices. If you\'re seeing gaps, this delay is the fix: 1-2s is usually enough for JPEG on a fast card, several seconds for RAW on a slow one.')+'</label><input type="number" min="0" value="'+cfg.delayAtWaypoint+'" onchange="cfg.delayAtWaypoint=parseFloat(this.value)||0"></div>' +
     '</div>' +
 
     // ── Battery & endurance — drives automatic mission splitting ──
     '<div class="panel-section"><h4>Battery &amp; endurance</h4>' +
     '<div class="field"><label>Battery</label><select onchange="setBattery(this.value)">'+batteryOptions()+'</select></div>' +
-    '<details><summary>Usable-time assumptions<span></span></summary><div class="details-body">' +
+    '<details><summary><span>Usable-time assumptions'+help('Rated flight times are windless lab-ideal figures. Real-world usable endurance is commonly 70-80% of rated, and standard practice reserves 20-30% battery for return-to-home/contingency -- default here is 75% x (1-30%) ~= 52% of the rated number.')+'</span><span></span></summary><div class="details-body">' +
       '<div class="field-row">' +
         '<div class="field"><label>Realistic-conditions factor</label><input type="number" step="0.05" min="0.1" max="1" value="'+cfg.realisticFactor+'" onchange="cfg.realisticFactor=parseFloat(this.value)||0.75;refreshEstimate()"></div>' +
         '<div class="field"><label>RTH/safety reserve</label><input type="number" step="0.05" min="0" max="0.6" value="'+cfg.reserveFraction+'" onchange="cfg.reserveFraction=parseFloat(this.value)||0.3;refreshEstimate()"></div>' +
       '</div>' +
-      '<div class="hint">Rated flight times are windless lab-ideal figures. Real-world usable endurance is commonly 70-80% of rated, and standard practice reserves 20-30% battery for return-to-home/contingency &mdash; default here is 75% &times; (1-30%) &asymp; 52% of the rated number.</div>' +
     '</div></details>' +
     '<div class="hint" style="margin-top:8px;">Usable per battery: <b>~'+usableBatteryMinutes(cfg).toFixed(0)+' min</b> of the '+cfg.batteryMinutes+' min rated.</div>' +
     '</div>' +
 
     // ── Capture purpose / gimbal — kept prominent since it's science-driven ──
     '<div class="panel-section"><h4>Capture purpose</h4>' +
-    '<div class="field"><label>What are you capturing?</label><select onchange="setGimbalPreset(this.value)">'+gimbalOptions()+'</select></div>' +
-    (gimbalNote ? '<div class="hint">'+gimbalNote+'</div>' : '') +
+    '<div class="field"><label>What are you capturing?'+(gimbalNote?help(gimbalNote):'')+'</label><select onchange="setGimbalPreset(this.value)">'+gimbalOptions()+'</select></div>' +
     '<div class="field" style="margin-top:8px;"><label>Gimbal pitch <span style="float:right;color:var(--text-faint);">-90&deg;=down &middot; 0&deg;=horizon</span></label>' +
-      '<input type="number" value="'+cfg.gimbalPitch+'" '+(cfg.threeDMapping?'disabled':'')+' onchange="cfg.gimbalPitch=parseFloat(this.value)||0;cfg.gimbalPreset=\'custom\';refreshEstimate()"></div>' +
-    (cfg.threeDMapping ? '<div class="hint">3D mapping is on, so this is unused &mdash; the nadir pass is fixed at -90&deg; and the oblique pass uses "Oblique pass gimbal pitch" under Grid survey settings below.</div>' : '') +
+      '<input type="number" value="'+cfg.gimbalPitch+'" '+(cfg.threeDMapping?'disabled title="3D mapping is on, so this is unused -- the nadir pass is fixed at -90° and the oblique pass uses the separate Oblique pass gimbal pitch field under Grid survey settings."':'')+' onchange="cfg.gimbalPitch=parseFloat(this.value)||0;cfg.gimbalPreset=\'custom\';refreshEstimate()"></div>' +
     '</div>' +
 
     // ── Per-mission-type settings, collapsed except the currently relevant one ──
@@ -2120,31 +2117,23 @@ function renderSetup(){
         'oninput="cfg.rotationDeg=parseFloat(this.value);document.getElementById(\'rot-val\').textContent=this.value+\'°\';refreshEstimate()"></div>' +
       '<button style="width:100%;margin-top:2px;" onclick="autoRotate()" title="Align the sweep to the area\'s longest edge, minimizing wasted transit distance">&#8635; Auto-rotate to minimize flight distance</button>' +
       '<div class="field" style="margin-top:6px;"><label>Wind from (&deg;, optional)</label><input id="wind-dir" type="number" min="0" max="359" placeholder="e.g. 270"></div>' +
-      '<button style="width:100%;margin-top:2px;" onclick="rotateForWind()" title="Fly the long passes into/with the wind rather than across it — steadier ground speed and less battery spent fighting a crosswind on every pass">&#8634; Align to wind</button>' +
-      '<div class="hint">Coverage-path research (e.g. Boustrophedon CPP for UAV surveys in wind) finds sweeping parallel to the wind (not perpendicular) covers faster with steadier speed. Enter the direction wind is coming FROM if you know it.</div>' +
-      '<div class="field" style="margin-top:8px;"><label>Turn style</label><select onchange="cfg.turnMode=this.value">' +
+      '<button style="width:100%;margin-top:2px;" onclick="rotateForWind()" title="Coverage-path research (e.g. Boustrophedon CPP for UAV surveys in wind) finds sweeping parallel to the wind, not across it, covers faster with steadier speed and less battery spent fighting a crosswind every pass. Enter the direction wind is coming FROM above, if you know it.">&#8634; Align to wind</button>' +
+      '<div class="field" style="margin-top:8px;"><label>Turn style'+help('Stopping at each point keeps camera position/GSD consistent for photogrammetry -- the standard choice for mapping. Smooth flythrough covers ground faster but can blur shots taken mid-turn.')+'</label><select onchange="cfg.turnMode=this.value">' +
         opt('toPointAndStopWithDiscontinuityCurvature',cfg.turnMode,'Stop at each point (precise — recommended for mapping)')+
         opt('toPointAndStopWithContinuityCurvature',cfg.turnMode,'Slow smooth turn, still stops')+
         opt('toPointAndPassWithContinuityCurvature',cfg.turnMode,'Smooth flythrough, never stops')+
       '</select></div>' +
-      '<div class="hint">Stopping at each point keeps camera position/GSD consistent for photogrammetry — the standard choice for mapping. Smooth flythrough covers ground faster but can blur shots taken mid-turn.</div>' +
-      '<div class="checkbox-row" style="margin-top:8px;'+(cfg.threeDMapping?'opacity:.4;':'')+'"><input type="checkbox" id="cb-xh" '+(cfg.crosshatch?'checked':'')+(cfg.threeDMapping?' disabled':'')+' onchange="cfg.crosshatch=this.checked;refreshEstimate()"><label for="cb-xh">Crosshatch (double grid) for thorough coverage</label></div>' +
-      (cfg.threeDMapping ?
-        '<div class="hint">Superseded by 3D mapping below, which already flies two full passes — crosshatch is ignored while it\'s on.</div>' :
-        '<div class="hint">Second pass at 90° to the first. Roughly doubles photo count and flight time but fills gaps a single sweep misses on irregular sites.</div>') +
-      '<div class="checkbox-row" style="margin-top:8px;"><input type="checkbox" id="cb-3d" '+(cfg.threeDMapping?'checked':'')+' onchange="cfg.threeDMapping=this.checked;if(this.checked)cfg.crosshatch=false;refreshEstimate();renderSetup()"><label for="cb-3d">3D mapping (nadir + oblique double-grid)</label></div>' +
-      '<div class="hint">Flies the area twice: once straight down, once tilted (rotated 90° from the first pass) — the method DJI Terra/Pix4D document for full 3D reconstruction, since a pure-nadir pass never images vertical surfaces like walls. Roughly doubles photo count.</div>' +
+      '<div class="checkbox-row" style="margin-top:8px;'+(cfg.threeDMapping?'opacity:.4;':'')+'"><input type="checkbox" id="cb-xh" '+(cfg.crosshatch?'checked':'')+(cfg.threeDMapping?' disabled':'')+' onchange="cfg.crosshatch=this.checked;refreshEstimate()"><label for="cb-xh">Crosshatch (double grid) for thorough coverage'+help(cfg.threeDMapping?'Superseded by 3D mapping below, which already flies two full passes -- crosshatch is ignored while it\'s on.':'Second pass at 90° to the first. Roughly doubles photo count and flight time but fills gaps a single sweep misses on irregular sites.')+'</label></div>' +
+      '<div class="checkbox-row" style="margin-top:8px;"><input type="checkbox" id="cb-3d" '+(cfg.threeDMapping?'checked':'')+' onchange="cfg.threeDMapping=this.checked;if(this.checked)cfg.crosshatch=false;refreshEstimate();renderSetup()"><label for="cb-3d">3D mapping (nadir + oblique double-grid)'+help('Flies the area twice: once straight down, once tilted (rotated 90° from the first pass) -- the method DJI Terra/Pix4D document for full 3D reconstruction, since a pure-nadir pass never images vertical surfaces like walls. Roughly doubles photo count.')+'</label></div>' +
       (cfg.threeDMapping ?
         '<div class="field" style="margin-top:8px;"><label>Oblique pass gimbal pitch</label><input type="number" value="'+cfg.obliqueGimbal+'" onchange="cfg.obliqueGimbal=parseFloat(this.value)||-45;refreshEstimate()"></div>' : '') +
-      '<details style="margin-top:8px;"><summary>Photo spacing override<span></span></summary><div class="details-body">' +
+      '<details style="margin-top:8px;"><summary><span>Photo spacing override'+help('Larger numbers = fewer, more spread-out photos. Leave at 0 to derive spacing from overlap % instead.')+'</span><span></span></summary><div class="details-body">' +
         '<div class="field-row">' +
           '<div class="field"><label>Line spacing (m, 0=auto)</label><input type="number" value="'+cfg.sideSpacingOverride+'" onchange="cfg.sideSpacingOverride=parseFloat(this.value)||0;refreshEstimate()"></div>' +
           '<div class="field"><label>Photo spacing (m, 0=auto)</label><input type="number" value="'+cfg.forwardSpacingOverride+'" onchange="cfg.forwardSpacingOverride=parseFloat(this.value)||0;refreshEstimate()"></div>' +
         '</div>' +
-        '<div class="hint">Larger numbers = fewer, more spread-out photos. Leave at 0 to derive spacing from overlap % instead.</div>' +
       '</div></details>' +
-      '<div class="checkbox-row" style="margin-top:8px;"><input type="checkbox" id="cb-ov" '+(cfg.overviewEnabled?'checked':'')+' onchange="cfg.overviewEnabled=this.checked;renderSetup()"><label for="cb-ov">Add a perimeter overview lap</label></div>' +
-      '<div class="hint">Quick lap around the boundary at a higher altitude, photo at every corner/mid-edge &mdash; whole-site context in addition to the detailed grid.</div>' +
+      '<div class="checkbox-row" style="margin-top:8px;"><input type="checkbox" id="cb-ov" '+(cfg.overviewEnabled?'checked':'')+' onchange="cfg.overviewEnabled=this.checked;renderSetup()"><label for="cb-ov">Add a perimeter overview lap'+help('Quick lap around the boundary at a higher altitude, photo at every corner/mid-edge -- whole-site context in addition to the detailed grid.')+'</label></div>' +
       (cfg.overviewEnabled ?
         '<div class="field-row" style="margin-top:8px;">' +
           '<div class="field"><label>Overview altitude (m, 0=auto 1.5&times;)</label><input type="number" value="'+cfg.overviewAltitude+'" onchange="cfg.overviewAltitude=parseFloat(this.value)||0"></div>' +
@@ -2165,21 +2154,18 @@ function renderSetup(){
         '<div class="field"><label>Orbit radius (m)</label><input type="number" value="'+cfg.orbitRadius+'" onchange="cfg.orbitRadius=parseFloat(this.value)||5;refreshEstimate()"></div>' +
         '<div class="field"><label>Orbit points</label><input type="number" value="'+cfg.orbitPoints+'" onchange="cfg.orbitPoints=parseInt(this.value)||8;refreshEstimate()"></div>' +
       '</div>' +
-      '<div class="checkbox-row"><input type="checkbox" id="cb-cw" '+(cfg.orbitClockwise?'checked':'')+' onchange="cfg.orbitClockwise=this.checked"><label for="cb-cw">Orbit clockwise</label></div>' +
-      '<div class="hint">Gimbal continuously tracks the center point — no fixed pitch needed here.</div>' +
-      '<div class="field" style="margin-top:8px;"><label>Turn style</label><select onchange="cfg.orbitTurnMode=this.value">' +
+      '<div class="checkbox-row"><input type="checkbox" id="cb-cw" '+(cfg.orbitClockwise?'checked':'')+' onchange="cfg.orbitClockwise=this.checked"><label for="cb-cw">Orbit clockwise'+help('Gimbal continuously tracks the center point -- no fixed pitch needed here.')+'</label></div>' +
+      '<div class="field" style="margin-top:8px;"><label>Turn style'+help('DJI Fly\'s continuity-curvature mode flies a smooth spline through the waypoints -- the only option here that actually looks and flies like a circle rather than a many-sided polygon with stop-and-rotate corners.')+'</label><select onchange="cfg.orbitTurnMode=this.value">' +
         opt('toPointAndPassWithContinuityCurvature',cfg.orbitTurnMode,'Smooth flythrough (recommended — flies an actual circle)')+
         opt('toPointAndStopWithContinuityCurvature',cfg.orbitTurnMode,'Slow smooth turn, still stops at each point')+
         opt('toPointAndStopWithDiscontinuityCurvature',cfg.orbitTurnMode,'Stop at each point (stuttering polygon, not a circle)')+
       '</select></div>' +
-      '<div class="hint">DJI Fly\'s continuity-curvature mode flies a smooth spline through the waypoints — the only option here that actually looks and flies like a circle rather than a many-sided polygon with stop-and-rotate corners.</div>' +
       '<div class="field" style="margin-top:8px;"><label>Altitude rings (1=single ring)</label><input type="number" min="1" max="8" value="'+cfg.orbitRings+'" onchange="cfg.orbitRings=parseInt(this.value)||1;refreshEstimate();renderSetup()"></div>' +
       (cfg.orbitRings>1 ?
         '<div class="field-row">' +
           '<div class="field"><label>Lowest ring altitude (m, 0=auto)</label><input type="number" value="'+cfg.orbitMinAltitude+'" onchange="cfg.orbitMinAltitude=parseFloat(this.value)||0;refreshEstimate()"></div>' +
-          '<div class="field"><label>Highest ring altitude (m, 0=auto)</label><input type="number" value="'+cfg.orbitMaxAltitude+'" onchange="cfg.orbitMaxAltitude=parseFloat(this.value)||0;refreshEstimate()"></div>' +
-        '</div>' +
-        '<div class="hint">Stacked rings at different altitudes around the same center &mdash; recommended for full 3D reconstruction of a tall/complex object (tower, silo, monument), where a single ring only sees it from one elevation angle. Aim for &ge;30 photos per ring.</div>'
+          '<div class="field"><label>Highest ring altitude (m, 0=auto)'+help('Stacked rings at different altitudes around the same center -- recommended for full 3D reconstruction of a tall/complex object (tower, silo, monument), where a single ring only sees it from one elevation angle. Aim for >=30 photos per ring.')+'</label><input type="number" value="'+cfg.orbitMaxAltitude+'" onchange="cfg.orbitMaxAltitude=parseFloat(this.value)||0;refreshEstimate()"></div>' +
+        '</div>'
         : '') +
     '</div></details>' +
     '</div>' +
@@ -2226,6 +2212,11 @@ function renderSetup(){
   refreshEstimate();
 }
 function opt(val,cur,label){ return '<option value="'+val+'"'+(cur===val?' selected':'')+'>'+label+'</option>'; }
+// A small hover-only "?" badge for the longer explanatory/citation text that used
+// to sit permanently under a field as a paragraph -- native title tooltip, so it
+// can't clip or overflow the sidebar the way a custom floating tooltip could in
+// this narrow, deeply-nested layout (this app has hit that overflow bug twice).
+function help(text){ return '<span class="help-icon" title="'+String(text).replace(/"/g,'&quot;')+'">?</span>'; }
 function setDrone(k){
   cfg.drone=k; var d=PRESETS.drones[k];
   cfg.droneEnumValue=d.droneEnumValue; cfg.droneSubEnumValue=d.droneSubEnumValue;
