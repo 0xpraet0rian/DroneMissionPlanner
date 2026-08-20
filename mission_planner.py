@@ -2080,6 +2080,10 @@ function renderSetup(){
       '<div class="field"><label>Speed (m/s)</label><input type="number" value="'+cfg.speed+'" onchange="cfg.speed=parseFloat(this.value)||1"></div>' +
     '</div>' +
     '<div class="field"><label>Delay at each waypoint (sec, 0=none)</label><input type="number" min="0" value="'+cfg.delayAtWaypoint+'" onchange="cfg.delayAtWaypoint=parseFloat(this.value)||0"></div>' +
+    '<div class="hint">The aircraft moves on once it considers the photo action done, which in real-world reports is roughly '+
+      '"shutter fired," not "confirmed written to the card" &mdash; on a slow card, or shooting RAW/DNG, that can mean a '+
+      'skipped photo the mission never notices. If you\'re seeing gaps, this delay is the fix: 1-2s is usually enough for '+
+      'JPEG on a fast card, several seconds for RAW on a slow one.</div>' +
     '</div>' +
 
     // ── Battery & endurance — drives automatic mission splitting ──
