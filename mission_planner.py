@@ -22,6 +22,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 """
 
 import os, sys, math, json, time, zipfile, threading, re, tempfile, shutil, base64
+import urllib.request, urllib.parse
 import xml.etree.ElementTree as ET
 import webview
 
@@ -64,6 +65,33 @@ def from_xy(x, y, ref_lat, ref_lon):
     lat = ref_lat + y / 110_540.0
     lon = ref_lon + x / (111_320.0 * math.cos(math.radians(ref_lat)))
     return lat, lon
+
+def fetch_elevations_m(coords):
+    """Batch ground-elevation lookup (meters, SRTM-derived) for a list of
+    (lat, lon) pairs via the free Open-Topo-Data API -- no key required. Used
+    for terrain-following altitude: DJI Fly's consumer app doesn't honor the
+    WPML aboveGroundLevel height mode (that's a Pilot 2 / FlightHub 2 /
+    enterprise-drone feature), so third-party planners like Litchi and Maven
+    get the same effect by computing per-waypoint altitude offsets themselves
+    and exporting plain relativeToStartPoint heights -- that's the approach
+    used here too. Raises on any failure so the caller can surface a clear
+    error instead of silently treating a network hiccup as flat terrain."""
+    elevations = []
+    for i in range(0, len(coords), 100):
+        chunk = coords[i:i + 100]
+        locs = '|'.join(f'{lat:.6f},{lon:.6f}' for lat, lon in chunk)
+        url = 'https://api.opentopodata.org/v1/srtm30m?locations=' + urllib.parse.quote(locs, safe='|,.-')
+        with urllib.request.urlopen(url, timeout=15) as resp:
+            data = json.loads(resp.read().decode('utf-8'))
+        if data.get('status') != 'OK':
+            raise RuntimeError('Elevation lookup failed: ' + str(data.get('error', data.get('status'))))
+        for r in data.get('results', []):
+            e = r.get('elevation')
+            if e is None:
+                raise RuntimeError('No elevation data for one or more points (outside SRTM coverage -- '
+                                    'far north/south, or over open ocean)')
+            elevations.append(e)
+    return elevations
 
 def footprint(altitude_m, sensor_w_mm, sensor_h_mm, focal_mm):
     """Ground footprint of one photo: altitude * sensorSize / focalLength (same
@@ -370,11 +398,17 @@ def _point_in_polygon(x, y, poly):
         j = i
     return inside
 
-def _sweep_coverage(rpts, side_spacing, forward_spacing):
+def _in_any_polygon(x, y, polys):
+    return any(_point_in_polygon(x, y, p) for p in polys) if polys else False
+
+def _sweep_coverage(rpts, side_spacing, forward_spacing, exclude_polys=None):
     """Boustrophedon (lawnmower) sweep across the polygon's bounding box, keeping
     only in-polygon sample points and snapping each row's last point out to the
     true edge so rows don't stop short. Each sample point becomes a photo
-    waypoint, so spacing directly controls how many photos the mission takes."""
+    waypoint, so spacing directly controls how many photos the mission takes.
+    exclude_polys is a list of hole polygons (same coordinate frame as rpts) —
+    a sample point inside any of them is skipped, same as if it were outside
+    the outer boundary."""
     xs = [p[0] for p in rpts]
     ys = [p[1] for p in rpts]
     minx, maxx = min(xs), max(xs)
@@ -386,10 +420,11 @@ def _sweep_coverage(rpts, side_spacing, forward_spacing):
         line = []
         x = minx
         while x <= maxx + 1e-9:
-            if _point_in_polygon(x, y, rpts):
+            if _point_in_polygon(x, y, rpts) and not _in_any_polygon(x, y, exclude_polys):
                 line.append((x, y))
             x += forward_spacing
-        if line and abs(maxx - line[-1][0]) > 1e-6 and _point_in_polygon(maxx, y, rpts):
+        if (line and abs(maxx - line[-1][0]) > 1e-6 and _point_in_polygon(maxx, y, rpts)
+                and not _in_any_polygon(maxx, y, exclude_polys)):
             line.append((maxx, y))
         if reverse:
             line.reverse()
@@ -398,7 +433,19 @@ def _sweep_coverage(rpts, side_spacing, forward_spacing):
         y += side_spacing
     return pts
 
-def generate_grid(polygon_latlon, cfg):
+def _project_exclusions(exclusions_latlon, ref_lat, ref_lon, cf, sf):
+    """Exclusion polygons come in as plain lat/lon like the boundary — reproject
+    them into the same rotated local-xy frame the boundary/sweep use, so a
+    single point-in-polygon check works for both."""
+    out = []
+    for excl in (exclusions_latlon or []):
+        if len(excl) < 3:
+            continue
+        exy = [to_xy(p[0], p[1], ref_lat, ref_lon) for p in excl]
+        out.append([(x * cf - y * sf, x * sf + y * cf) for x, y in exy])
+    return out
+
+def generate_grid(polygon_latlon, cfg, exclusions_latlon=None):
     if len(polygon_latlon) < 3:
         raise ValueError('A grid area needs at least 3 points')
     ref_lat = sum(p[0] for p in polygon_latlon) / len(polygon_latlon)
@@ -411,14 +458,16 @@ def generate_grid(polygon_latlon, cfg):
     cf, sf = math.cos(-rot), math.sin(-rot)
     ci, si = math.cos(rot), math.sin(rot)
     rpts = [(x * cf - y * sf, x * sf + y * cf) for x, y in pts_xy]
+    exclude_rpolys = _project_exclusions(exclusions_latlon, ref_lat, ref_lon, cf, sf)
 
-    pts = _sweep_coverage(rpts, side_spacing, forward_spacing)
+    pts = _sweep_coverage(rpts, side_spacing, forward_spacing, exclude_rpolys)
     if cfg.get('crosshatch'):
         # A second sweep at 90° catches gaps the first sweep's direction misses,
         # especially on concave/irregular site boundaries — appended as a second
         # pass rather than interleaved, so it always runs after the main grid.
         transposed = [(y, x) for x, y in rpts]
-        pts2 = _sweep_coverage(transposed, side_spacing, forward_spacing)
+        transposed_excl = [[(y, x) for x, y in poly] for poly in exclude_rpolys]
+        pts2 = _sweep_coverage(transposed, side_spacing, forward_spacing, transposed_excl)
         pts += [(x, y) for y, x in pts2]
 
     if not pts:
@@ -433,20 +482,20 @@ def generate_grid(polygon_latlon, cfg):
                            'photo': True, 'hover': cfg.get('delayAtWaypoint', 0)})
     return waypoints
 
-def generate_3d_mapping(polygon_latlon, cfg):
+def generate_3d_mapping(polygon_latlon, cfg, exclusions_latlon=None):
     """Nadir + oblique double-grid for full 3D reconstruction (DJI Terra/Pix4D
     method): a straight-down pass for top surfaces plus a second, 90°-rotated
     pass at an oblique angle so facades actually get imaged too."""
     nadir_cfg = dict(cfg)
     nadir_cfg['gimbalPitch'] = -90
     nadir_cfg['crosshatch'] = False
-    nadir_pts = generate_grid(polygon_latlon, nadir_cfg)
+    nadir_pts = generate_grid(polygon_latlon, nadir_cfg, exclusions_latlon)
 
     oblique_cfg = dict(cfg)
     oblique_cfg['gimbalPitch'] = cfg.get('obliqueGimbal', -45)
     oblique_cfg['rotationDeg'] = (cfg.get('rotationDeg', 0) + 90) % 360
     oblique_cfg['crosshatch'] = False
-    oblique_pts = generate_grid(polygon_latlon, oblique_cfg)
+    oblique_pts = generate_grid(polygon_latlon, oblique_cfg, exclusions_latlon)
 
     return nadir_pts + oblique_pts
 
@@ -1117,10 +1166,10 @@ class Api:
             return {'ok': False, 'msg': str(e)}
 
     # ── Generators ──
-    def generate_grid(self, polygon, cfg):
+    def generate_grid(self, polygon, cfg, exclusions=None):
         try:
             fn = generate_3d_mapping if cfg.get('threeDMapping') else generate_grid
-            return {'ok': True, 'waypoints': fn(polygon, cfg)}
+            return {'ok': True, 'waypoints': fn(polygon, cfg, exclusions)}
         except Exception as e:
             return {'ok': False, 'msg': str(e)}
 
@@ -1147,6 +1196,27 @@ class Api:
             return {'ok': True, **estimate_coverage(polygon, cfg)}
         except Exception as e:
             return {'ok': False, 'msg': str(e)}
+
+    def terrain_follow(self, waypoints, ref_lat, ref_lon):
+        """Adjust each waypoint's altitude so real height above ground stays
+        constant over sloped terrain, using the first waypoint (or wherever the
+        caller says launch will happen) as the elevation reference point --
+        same assumption Litchi/Maven make, since the planner can't know the
+        actual takeoff spot in advance either."""
+        if not waypoints:
+            return {'ok': False, 'msg': 'No waypoints to adjust'}
+        try:
+            coords = [(ref_lat, ref_lon)] + [(wp['lat'], wp['lon']) for wp in waypoints]
+            elevations = fetch_elevations_m(coords)
+            ref_elev = elevations[0]
+            altitudes = [round(wp['alt'] + (e - ref_elev), 1) for wp, e in zip(waypoints, elevations[1:])]
+            min_alt = min(altitudes)
+            warn = (f'Lowest adjusted altitude is {min_alt}m -- double check nothing dips too close to '
+                    f'the ground; SRTM data is ~30m resolution and can miss small terrain features.'
+                    if min_alt < 5 else None)
+            return {'ok': True, 'altitudes': altitudes, 'warn': warn}
+        except Exception as e:
+            return {'ok': False, 'msg': f'Elevation lookup failed (needs internet access): {e}'}
 
     def optimal_rotation(self, polygon):
         try:
@@ -1221,6 +1291,39 @@ class Api:
                 written.append(fname)
             return {'ok': True, 'msg': f'Exported {len(batches)} battery-sized missions to {out_dir}: '
                                         + ', '.join(written)}
+        except Exception as e:
+            return {'ok': False, 'msg': str(e)}
+
+    def export_gcps(self, gcps, filename=None):
+        # A plain lat/lon CSV, not a flight waypoint file -- GCPs are reference
+        # markers for correcting the orthomosaic afterward in Pix4D/Metashape/
+        # WebODM, all of which import a Label/Latitude/Longitude CSV directly.
+        # They're never written into the WPML export, since DJI Fly would try
+        # to fly to them.
+        if not gcps:
+            return {'ok': False, 'msg': 'No ground control points to export'}
+        fname = _safe_filename(filename) or 'gcps.csv'
+        if not fname.lower().endswith('.csv'):
+            fname += '.csv'
+        try:
+            path = self._window.create_file_dialog(
+                webview.SAVE_DIALOG, save_filename=fname,
+                file_types=('Ground control points (*.csv)',)
+            )
+        except Exception as e:
+            return {'ok': False, 'msg': f'Dialog error: {e}'}
+        if not path:
+            return {'ok': False, 'msg': 'Cancelled'}
+        out = path if isinstance(path, str) else path[0]
+        if not out.lower().endswith('.csv'):
+            out += '.csv'
+        try:
+            with open(out, 'w', encoding='utf-8', newline='') as f:
+                f.write('Label,Latitude,Longitude\n')
+                for p in gcps:
+                    label = str(p.get('label', '')).replace(',', ' ').replace('"', "'")
+                    f.write(f"{label},{p['lat']:.8f},{p['lon']:.8f}\n")
+            return {'ok': True, 'msg': f'Exported {len(gcps)} ground control point(s) to {os.path.basename(out)}'}
         except Exception as e:
             return {'ok': False, 'msg': str(e)}
 
@@ -1607,13 +1710,15 @@ var waypoints = [];      // {lat,lon,alt,speed,gimbal,heading_mode,heading_angle
 var pois = [];
 var importedLayers = []; // {kind:'polygon'|'line'|'point', name, coords/lat/lon}
 var activeTab = 'setup';
-var drawMode = null;     // 'area'|'route'|'orbit'|'manual'
+var drawMode = null;     // 'area'|'route'|'orbit'|'manual'|'exclude'|'gcp'
 var tempPoints = [];
 var selectedWpIdx = null;
 var pendingKind = null;      // 'grid'|'corridor'|'orbit' — the source shape for the current mission
 var pendingGeom = null;
 var pendingGenerated = false; // true once this pending shape has been generated at least once
 var missionName = 'Mission';  // prompted at the start of each mission, used as the export filename prefix
+var exclusionZones = []; // [{coords:[[lat,lon],...]}] — no-fly holes a grid mission skips
+var gcpPoints = [];       // [{lat,lon,label}] — ground control points, exported separately, never flown to
 
 // ── Client-side coverage estimate (mirrors the Python formulas exactly) ────
 // footprint = altitude * sensorSize / focalLength — real sensor/lens physics, same
@@ -1659,7 +1764,17 @@ function pointInPolygonJS(x,y,poly){
   }
   return inside;
 }
-function sweepCoverageJS(rpts, sideSpacing, forwardSpacing){
+function pointInAnyPolygonJS(x,y,polys){
+  if(!polys || !polys.length) return false;
+  for(var i=0;i<polys.length;i++){ if(pointInPolygonJS(x,y,polys[i])) return true; }
+  return false;
+}
+function projectExclusionsJS(exclusions, refLat, refLon, cf, sf){
+  return (exclusions||[]).filter(e=>e.length>=3).map(function(e){
+    return e.map(p=>toXY(p[0],p[1],refLat,refLon)).map(p=>[p[0]*cf-p[1]*sf, p[0]*sf+p[1]*cf]);
+  });
+}
+function sweepCoverageJS(rpts, sideSpacing, forwardSpacing, excludePolys){
   var xs=rpts.map(p=>p[0]), ys=rpts.map(p=>p[1]);
   var minx=Math.min.apply(null,xs), maxx=Math.max.apply(null,xs);
   var miny=Math.min.apply(null,ys), maxy=Math.max.apply(null,ys);
@@ -1667,34 +1782,37 @@ function sweepCoverageJS(rpts, sideSpacing, forwardSpacing){
   for(var y=miny; y<=maxy+1e-9 && count<maxIter; y+=sideSpacing){
     var line=[];
     for(var x=minx; x<=maxx+1e-9 && count<maxIter; x+=forwardSpacing, count++){
-      if(pointInPolygonJS(x,y,rpts)) line.push([x,y]);
+      if(pointInPolygonJS(x,y,rpts) && !pointInAnyPolygonJS(x,y,excludePolys)) line.push([x,y]);
     }
-    if(line.length && Math.abs(maxx-line[line.length-1][0])>1e-6 && pointInPolygonJS(maxx,y,rpts)) line.push([maxx,y]);
+    if(line.length && Math.abs(maxx-line[line.length-1][0])>1e-6 && pointInPolygonJS(maxx,y,rpts) && !pointInAnyPolygonJS(maxx,y,excludePolys)) line.push([maxx,y]);
     if(reverse) line.reverse();
     pts=pts.concat(line);
     reverse=!reverse;
   }
   return pts;
 }
-function estimateGrid(polygon, c){
+function estimateGrid(polygon, c, exclusions){
   if(!polygon || polygon.length<3) return null;
   var refLat=polygon.reduce((s,p)=>s+p[0],0)/polygon.length;
   var refLon=polygon.reduce((s,p)=>s+p[1],0)/polygon.length;
   var pts=polygon.map(p=>toXY(p[0],p[1],refLat,refLon));
   var rot=(c.rotationDeg||0)*Math.PI/180, cf=Math.cos(-rot), sf=Math.sin(-rot);
   var rpts=pts.map(p=>[p[0]*cf-p[1]*sf, p[0]*sf+p[1]*cf]);
+  var exPolys=projectExclusionsJS(exclusions, refLat, refLon, cf, sf);
   var sp=coverageSpacing(c);
   var side=sp[0], forward=sp[1];
-  var count=sweepCoverageJS(rpts, side, forward).length;
+  var count=sweepCoverageJS(rpts, side, forward, exPolys).length;
   if(c.crosshatch && !c.threeDMapping){
     var transposed=rpts.map(p=>[p[1],p[0]]);
-    count += sweepCoverageJS(transposed, side, forward).length;
+    var exTransposed=exPolys.map(poly=>poly.map(p=>[p[1],p[0]]));
+    count += sweepCoverageJS(transposed, side, forward, exTransposed).length;
   }
   if(c.threeDMapping){
     // Mirrors generate_3d_mapping: a second full pass rotated 90°, oblique gimbal.
     var rot2=((c.rotationDeg||0)+90)*Math.PI/180, cf2=Math.cos(-rot2), sf2=Math.sin(-rot2);
     var rpts2=pts.map(p=>[p[0]*cf2-p[1]*sf2, p[0]*sf2+p[1]*cf2]);
-    count += sweepCoverageJS(rpts2, side, forward).length;
+    var exPolys2=projectExclusionsJS(exclusions, refLat, refLon, cf2, sf2);
+    count += sweepCoverageJS(rpts2, side, forward, exPolys2).length;
   }
   var xs=rpts.map(p=>p[0]), ys=rpts.map(p=>p[1]);
   var passes=Math.max(1,Math.round((Math.max.apply(null,ys)-Math.min.apply(null,ys))/side)+1);
@@ -1724,7 +1842,7 @@ function refreshEstimate(){
     return;
   }
   var est=null, areaM2=0;
-  if(pendingKind==='grid'){ est=estimateGrid(pendingGeom, cfg); areaM2=polygonAreaM2(pendingGeom); }
+  if(pendingKind==='grid'){ est=estimateGrid(pendingGeom, cfg, exclusionZones.map(z=>z.coords)); areaM2=polygonAreaM2(pendingGeom); }
   else if(pendingKind==='corridor') est=estimateCorridor(pendingGeom, cfg);
   if(!est){ el.innerHTML=''; return; }
   var shutter=recommendedShutterSpeed(cfg);
@@ -1768,6 +1886,8 @@ var importedGroup = L.layerGroup().addTo(map);
 var tempGroup = L.layerGroup().addTo(map);
 var wpGroup = L.layerGroup().addTo(map);
 var snapGroup = L.layerGroup().addTo(map);
+var exclusionGroup = L.layerGroup().addTo(map);
+var gcpGroup = L.layerGroup().addTo(map);
 var wpPathLayer = null;
 var wpMarkers = {};
 
@@ -1781,6 +1901,8 @@ L.control.layers({
 }, {
   'Imported KML/KMZ': importedGroup,
   'Flight path': wpGroup,
+  'No-fly / exclusion zones': exclusionGroup,
+  'Ground control points': gcpGroup,
 }, {position:'topright', collapsed:true}).addTo(map);
 
 // ── Init ───────────────────────────────────────────────────────────────────
@@ -1897,6 +2019,22 @@ function renderSetup(){
       '<button onclick="startDraw(\'orbit\')">&#9678;<br>Orbit</button>' +
       '<button onclick="startDraw(\'manual\')">&#128204;<br>Manual</button>' +
     '</div></div>' +
+
+    // ── Site markup — no-fly holes and survey-control reference points ──
+    '<div class="panel-section"><h4>Site markup</h4>' +
+    '<div class="field-row">' +
+      '<div class="field"><button style="width:100%;" onclick="startDraw(\'exclude\')" title="Draw a hole inside a grid survey area that the flight path skips entirely">&#9888; Draw no-fly zone</button></div>' +
+      '<div class="field"><button style="width:100%;" onclick="startDraw(\'gcp\')" title="Drop reference markers at known coordinates for correcting the orthomosaic afterward in Pix4D/Metashape/WebODM">&#128204; Place ground control point</button></div>' +
+    '</div>' +
+    (exclusionZones.length ?
+      '<div class="hint" style="margin-top:6px;">'+exclusionZones.length+' no-fly zone(s) active on the current grid area &mdash; '+
+      '<a href="#" onclick="clearExclusionZones();return false;">clear all</a></div>' : '') +
+    '<div class="field" style="margin-top:8px;"><label>Ground control points<span style="float:right;">'+
+      (gcpPoints.length ? '<a href="#" onclick="clearGCPs();return false;">clear all</a>' : '')+'</span></label>' +
+      '<div id="gcp-list"></div>' +
+      (gcpPoints.length ? '<button style="width:100%;margin-top:6px;" onclick="exportGCPs()">&#11123; Export GCPs (.csv)</button>' : '') +
+    '</div>' +
+    '</div>' +
 
     // ── Core flight parameters (always visible — used by every mission type) ──
     '<div class="panel-section"><h4>Flight</h4>' +
@@ -2042,6 +2180,7 @@ function renderSetup(){
         opt('relativeToStartPoint',cfg.heightMode,'Relative to takeoff point (recommended)')+
         opt('EGM96',cfg.heightMode,'Sea level (EGM96)')+'</select></div>' +
     '</div></details>';
+  renderGCPList();
   refreshEstimate();
 }
 function opt(val,cur,label){ return '<option value="'+val+'"'+(cur===val?' selected':'')+'>'+label+'</option>'; }
@@ -2113,18 +2252,20 @@ function promptMissionName(){
   if(name!==null && name.trim()!=='') missionName = sanitizeMissionName(name);
 }
 function startDraw(mode){
-  promptMissionName();
+  if(mode!=='exclude' && mode!=='gcp') promptMissionName();
   drawMode = mode; tempPoints = [];
   tempGroup.clearLayers();
   var hint = document.getElementById('draw-hint');
   hint.classList.add('visible');
-  document.getElementById('btn-finish').style.display = (mode==='orbit'||mode==='manual') ? 'none' : 'inline-block';
+  document.getElementById('btn-finish').style.display = (mode==='orbit'||mode==='manual'||mode==='gcp') ? 'none' : 'inline-block';
   document.getElementById('btn-cancel').style.display = 'inline-block';
   var snapNote = importedLayers.length ? ' Clicks near an imported line/point snap to it.' : '';
   if(mode==='area') hint.textContent='Click to add area corners (min. 3). Click "Finish" when done.'+snapNote;
   if(mode==='route') hint.textContent='Click to add route points (min. 2). Click "Finish" when done.'+snapNote;
   if(mode==='orbit') hint.textContent='Click on the map to place the orbit center.'+snapNote;
   if(mode==='manual') hint.textContent='Click to add waypoints. Click "Cancel" or switch tools to stop.'+snapNote;
+  if(mode==='exclude') hint.textContent='Click to add corners of a no-fly hole (min. 3). Click "Finish" when done.'+snapNote;
+  if(mode==='gcp') hint.textContent='Click to drop ground control points. Click "Cancel" or switch tools to stop.'+snapNote;
 }
 function cancelDraw(){
   drawMode = null; tempPoints = [];
@@ -2188,7 +2329,7 @@ map.on('click', function(e){
   if(!drawMode) return;
   var snap=findSnapPoint(e.latlng);
   var lat=snap?snap[0]:e.latlng.lat, lon=snap?snap[1]:e.latlng.lng;
-  if(drawMode==='area' || drawMode==='route'){
+  if(drawMode==='area' || drawMode==='route' || drawMode==='exclude'){
     tempPoints.push([lat,lon]);
     redrawTemp();
   } else if(drawMode==='orbit'){
@@ -2197,19 +2338,23 @@ map.on('click', function(e){
     showTab('setup');
   } else if(drawMode==='manual'){
     addManualWaypoint(lat,lon);
+  } else if(drawMode==='gcp'){
+    addGCP(lat,lon);
   }
 });
 
 function redrawTemp(){
   tempGroup.clearLayers();
   if(tempPoints.length===0) return;
-  if(drawMode==='area'){
-    if(tempPoints.length>=3) L.polygon(tempPoints,{color:'#e07b00',fillOpacity:.15,weight:2}).addTo(tempGroup);
-    else L.polyline(tempPoints,{color:'#e07b00',weight:2,dashArray:'4,4'}).addTo(tempGroup);
+  if(drawMode==='area' || drawMode==='exclude'){
+    var col = drawMode==='exclude' ? '#e0342e' : '#e07b00';
+    if(tempPoints.length>=3) L.polygon(tempPoints,{color:col,fillOpacity:.15,weight:2}).addTo(tempGroup);
+    else L.polyline(tempPoints,{color:col,weight:2,dashArray:'4,4'}).addTo(tempGroup);
   } else {
     L.polyline(tempPoints,{color:'#e07b00',weight:2}).addTo(tempGroup);
   }
-  tempPoints.forEach(function(p){ L.circleMarker(p,{radius:5,color:'#000',weight:1,fillColor:'#e07b00',fillOpacity:1}).addTo(tempGroup); });
+  var mcol = drawMode==='exclude' ? '#e0342e' : '#e07b00';
+  tempPoints.forEach(function(p){ L.circleMarker(p,{radius:5,color:'#000',weight:1,fillColor:mcol,fillOpacity:1}).addTo(tempGroup); });
 }
 
 function finishDraw(){
@@ -2219,9 +2364,80 @@ function finishDraw(){
   } else if(drawMode==='route'){
     if(tempPoints.length<2){ alert('Add at least 2 points to define a route.'); return; }
     pendingKind='corridor'; pendingGeom=tempPoints.slice(); pendingGenerated=false;
+  } else if(drawMode==='exclude'){
+    if(tempPoints.length<3){ alert('Add at least 3 points to define a no-fly hole.'); return; }
+    exclusionZones.push({coords: tempPoints.slice()});
+    redrawExclusionZones();
+    refreshEstimate();
   }
   cancelDraw();
   showTab('setup');
+}
+
+// ── No-fly / exclusion zones — holes a grid mission's coverage skips ───────
+function redrawExclusionZones(){
+  exclusionGroup.clearLayers();
+  exclusionZones.forEach(function(z,i){
+    L.polygon(z.coords,{color:'#e0342e',weight:2,fillColor:'#e0342e',fillOpacity:.25,dashArray:'6,4'})
+      .bindTooltip('No-fly zone '+(i+1))
+      .addTo(exclusionGroup);
+  });
+}
+function clearExclusionZones(){
+  if(!exclusionZones.length) return;
+  if(!confirm('Remove all '+exclusionZones.length+' exclusion zone(s)?')) return;
+  exclusionZones = [];
+  redrawExclusionZones();
+  refreshEstimate();
+}
+
+// ── Ground control points — reference markers exported separately, never flown to ──
+function addGCP(lat,lon){
+  var label = 'GCP'+(gcpPoints.length+1);
+  gcpPoints.push({lat:lat, lon:lon, label:label});
+  redrawGCPs();
+}
+function redrawGCPs(){
+  gcpGroup.clearLayers();
+  gcpPoints.forEach(function(p,i){
+    L.circleMarker([p.lat,p.lon],{radius:7,color:'#000',weight:1,fillColor:'#2e8fe0',fillOpacity:1})
+      .bindTooltip(p.label, {permanent:true, direction:'top', offset:[0,-8], className:'gcp-label'})
+      .on('click', function(){ renameGCP(i); })
+      .addTo(gcpGroup);
+  });
+  renderGCPList();
+}
+function renameGCP(i){
+  var name = window.prompt('Label for this GCP:', gcpPoints[i].label);
+  if(name!==null && name.trim()!=='') gcpPoints[i].label = name.trim();
+  redrawGCPs();
+}
+function deleteGCP(i){
+  gcpPoints.splice(i,1);
+  redrawGCPs();
+}
+function clearGCPs(){
+  if(!gcpPoints.length) return;
+  if(!confirm('Remove all '+gcpPoints.length+' ground control point(s)?')) return;
+  gcpPoints = [];
+  redrawGCPs();
+}
+function renderGCPList(){
+  var el = document.getElementById('gcp-list');
+  if(!el) return;
+  if(gcpPoints.length===0){ el.innerHTML='<div class="hint">None placed yet.</div>'; return; }
+  el.innerHTML = gcpPoints.map(function(p,i){
+    return '<div class="field-row" style="align-items:center;margin-top:4px;">' +
+      '<span style="flex:1;font-size:12px;">'+p.label+' <span style="color:var(--text-faint);">'+p.lat.toFixed(6)+', '+p.lon.toFixed(6)+'</span></span>' +
+      '<span onclick="deleteGCP('+i+')" style="cursor:pointer;color:var(--red);font-weight:bold;opacity:.7;">&#10005;</span>' +
+    '</div>';
+  }).join('');
+}
+function exportGCPs(){
+  if(!gcpPoints.length){ alert('No ground control points placed yet.'); return; }
+  pywebview.api.export_gcps(gcpPoints, buildExportFilename(waypoints)+'_gcps.csv').then(function(res){
+    setStatus(res.msg); if(!res.ok && res.msg!=='Cancelled') alert(res.msg);
+  });
 }
 
 function commitPending(){
@@ -2246,7 +2462,8 @@ function mergeOverviewIfEnabled(polygonForOverview){
 // after generating and can be tuned + regenerated in place.
 function generateGridMission(polygon){
   showProgress('Generating grid...');
-  pywebview.api.generate_grid(polygon, cfg).then(function(res){
+  var exclusions = exclusionZones.map(function(z){ return z.coords; });
+  pywebview.api.generate_grid(polygon, cfg, exclusions).then(function(res){
     if(!res.ok){ hideProgress(); alert('Grid generation failed: '+res.msg); return; }
     waypoints = res.waypoints; pois=[]; selectedWpIdx=null; pendingGenerated=true;
     mergeOverviewIfEnabled(polygon).then(function(){
@@ -2354,9 +2571,25 @@ function renderWaypointsTab(){
     '</tr>';
   }).join('');
   el.innerHTML = replayPanelHtml() +
+    '<div class="row" style="margin-bottom:8px;">' +
+      '<button onclick="applyTerrainFollow()" title="Looks up ground elevation under every waypoint (needs internet) and shifts each altitude so real height above ground stays constant over sloped terrain, instead of a flat plane from the first waypoint">&#9968; Apply terrain-following altitude</button>' +
+    '</div>' +
     '<table id="wp-table"><thead><tr><th>#</th><th>Alt(m)</th><th>Spd</th><th>Gimbal</th><th>Photo</th><th></th></tr></thead>' +
     '<tbody>'+rows+'</tbody></table>';
   updateReplayUI();
+}
+function applyTerrainFollow(){
+  if(waypoints.length===0) return;
+  if(!confirm('This looks up ground elevation for every waypoint online (SRTM data, ~30m resolution) and shifts each waypoint\'s altitude to hold a constant height above the actual ground instead of a flat plane from the first waypoint.\n\nIt overwrites the altitude values directly -- regenerate the mission to go back to flat AGL. Continue?')) return;
+  var ref = waypoints[0];
+  setStatus('Looking up terrain elevation...');
+  pywebview.api.terrain_follow(waypoints, ref.lat, ref.lon).then(function(res){
+    if(!res.ok){ alert(res.msg); setStatus(''); return; }
+    res.altitudes.forEach(function(a,i){ waypoints[i].alt = a; });
+    renderWaypoints(); renderWaypointsTab(); updateStats();
+    setStatus(res.warn ? res.warn : 'Terrain-following altitude applied.');
+    if(res.warn) alert(res.warn);
+  });
 }
 function deleteWaypoint(i){
   waypoints.splice(i,1);
@@ -2740,7 +2973,8 @@ function confirmUploadToSlot(uuid){
   });
 }
 function saveProject(){
-  var data = JSON.stringify({cfg:cfg, waypoints:waypoints, pois:pois}, null, 2);
+  var data = JSON.stringify({cfg:cfg, waypoints:waypoints, pois:pois,
+    exclusionZones:exclusionZones, gcpPoints:gcpPoints}, null, 2);
   pywebview.api.save_project(data).then(function(res){ setStatus(res.msg); if(!res.ok && res.msg!=='Cancelled') alert(res.msg); });
 }
 function loadProject(){
@@ -2751,8 +2985,11 @@ function loadProject(){
       cfg = Object.assign({}, PRESETS.defaults, data.cfg||{});
       waypoints = data.waypoints||[];
       pois = data.pois||[];
+      exclusionZones = data.exclusionZones||[];
+      gcpPoints = data.gcpPoints||[];
       selectedWpIdx=null;
       pendingKind=null; pendingGeom=null; pendingGenerated=false;
+      redrawExclusionZones(); redrawGCPs();
       renderWaypoints(); renderSetup(); showTab('waypoints'); setStatus(res.msg);
     }catch(e){ alert('Invalid project file: '+e); }
   });

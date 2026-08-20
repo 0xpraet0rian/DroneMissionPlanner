@@ -76,9 +76,32 @@ a circular path built from stop-and-rotate segments flies a stuttering many-side
 instead of a circle, so orbit missions use the smooth spline mode by default, which is
 what actually produces a circular flight path. Both are overridable per mission type.
 
+**No-fly / exclusion zones.** Draw a hole (a building, a hazard, restricted airspace)
+inside a grid survey area and the coverage pattern skips it entirely instead of flying
+straight over it. Works with crosshatch and 3D-mapping too, and the live estimate honors
+it exactly — it runs the same coverage math client-side, not an approximation, same as
+the rest of the estimate.
+
+**Ground control points.** Drop reference markers at known coordinates directly on the
+map — click to rename, click the &times; to remove — and export them as a plain
+`Label,Latitude,Longitude` CSV, the format Pix4D/Metashape/WebODM all import directly for
+correcting the orthomosaic afterward. They're never written into the flight-path export;
+DJI Fly would try to fly to them if they were.
+
+**Terrain-following altitude.** One button (in the Waypoints tab, after generating a
+mission) looks up ground elevation under every waypoint from a free SRTM-derived
+elevation API and shifts each altitude so real height above ground stays roughly
+constant over sloped terrain, instead of a flat plane projected from the first waypoint.
+DJI Fly's consumer app doesn't honor WPML's `aboveGroundLevel` height mode — that's a
+Pilot 2 / FlightHub 2 / enterprise-drone feature — so this computes the offsets itself
+and bakes them into ordinary `relativeToStartPoint` altitudes, the same approach
+third-party planners like Litchi and Maven use to get terrain-following on consumer
+drones. Needs internet access; SRTM data is ~30m resolution, so it's a real help on
+hillsides, not a substitute for caution near sharp terrain features.
+
 **Map layers** — Street, Satellite, Satellite with labels, Topographic, Dark, switchable
-from a layer control, with imported layers and the flight path as separate toggleable
-overlays.
+from a layer control, with imported layers, the flight path, exclusion zones, and ground
+control points all as separate toggleable overlays.
 
 **Mission replay** — play/pause/scrub through the generated mission on the map with a
 moving marker, so you can sanity-check the flight path before you ever fly it.
