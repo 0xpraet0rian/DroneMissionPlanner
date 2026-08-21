@@ -37,22 +37,55 @@ DJI "auto" pattern:
   elevation angle, which a single ring can't do well.
 - **Manual** — click to drop waypoints one at a time, each independently editable.
 
+### How grid/corridor missions actually fly (and why)
+
+A grid or corridor mission does **not** put a real waypoint at every photo. Early
+versions did, and real flight testing surfaced two problems at once: the aircraft
+visibly hunting for position every time it stopped to "take" a photo (normal
+position-hold behavior at that density, not a malfunction — but genuinely unpleasant to
+watch and bad for image sharpness), and the RC2's own mission UI struggling once a
+survey reached the waypoint counts that overlap/altitude settings produce trivially (a
+modest survey can easily want thousands). Neither is a bug specific to this app —
+independent reports (a Litchi forum thread, unrelated to this project) describe the same
+RC2 instability on mapping missions with many closely-packed points, and DJI's own
+consumer waypoint documentation only supports discrete stop-and-shoot camera actions, not
+a continuous-flight interval trigger — that WPML mechanism exists but is documented as
+enterprise-drone-only (M300/M350/M30/M3-series), not available on Mini/Air/Mavic-class
+hardware.
+
+What actually works, confirmed independently by [HOT's `drone-flightplan`](https://github.com/hotosm/drone-flightplan)
+(a production tool used for real humanitarian drone mapping): put waypoints only at each
+row's start and end, fly the row as one continuous straight line, and let the **camera's
+own Timer/interval-shooting mode** — set manually on the controller before the flight,
+since it can't be written into a WPML file — fire the shutter throughout. Cruise speed is
+then *derived from* that fixed interval (`photo spacing ÷ camera interval`) rather than
+the other way around, so a photo still lands roughly where it's supposed to. The app
+tells you the exact interval and speed to set before every grid/corridor flight, in the
+live estimate and again in the Waypoints tab. **This is a manual pre-flight step the app
+cannot do for you — skip it and the mission still flies, it just won't take any
+photos.** No-fly zones still work correctly with this: a zone cutting through a row
+splits it into separate flyable segments instead of drawing a straight line through it.
+
+Orbit and Manual missions are unaffected — their waypoints were always meant to be
+individual shots, not a continuous strip, so they keep ordinary per-waypoint photo
+actions.
+
 Every generated mission shows a live estimate — photo count, area, flight time,
 recommended shutter speed to avoid motion blur — **before** you commit to it, computed
 by literally running the real generator client-side rather than a rough formula that
 might disagree with what actually gets built.
 
-Flight time itself accounts for acceleration, not just distance÷speed: the default
-stop-and-rotate turn mode means the aircraft actually stops and re-accelerates at every
-waypoint, and on a tightly-spaced grid — low altitude, high overlap — it can spend the
-whole mission never reaching cruise speed at all. A distance÷speed estimate misses that
-entirely and can undercount real flight time several times over; this one models the
+Flight time accounts for acceleration, not just distance÷speed: the aircraft doesn't
+teleport to cruise speed, and a short leg (the hop between two rows, for instance) can
+mean it never gets there at all before decelerating again. A distance÷speed estimate
+misses that and can undercount real flight time several times over; this one models the
 accelerate/cruise/decelerate profile per leg (1.4 m/s² default, editable under Setup →
 Aircraft & camera → Advanced, sourced from real acceleration-aware path-planning
-research) and warns in the Waypoints tab when a mission is spending most of its time
-never reaching cruise speed. It also feeds directly into "Export by Battery," so a
-mission that looked like it fit on one battery under the old flat estimate won't
-silently turn out not to.
+research). It also feeds directly into "Export by Battery," so a mission that looked like
+it fit on one battery under a flat estimate won't silently turn out not to — and that
+same export step now also splits on waypoint count (DJI Fly's own 200-per-file cap on
+current consumer drones, kept well clear of by default) whenever a mission needs it,
+independent of battery life.
 
 **Capture-purpose presets** set the gimbal angle (and matching overlap %) from published
 sources instead of a guessed default: flat 2D mapping, vegetation/crop health, elevation/

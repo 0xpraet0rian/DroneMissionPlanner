@@ -372,6 +372,29 @@ DEFAULT_MISSION_CONFIG = {
     # MDPI Drones journal), which found ignoring this inflates flight-time
     # accuracy errors by up to 1.7x versus reality -- exactly this effect.
     'droneAccel': 1.4,
+    # DJI Fly currently caps a single waypoint mission at 200 waypoints on the
+    # Mini 5 Pro and other current consumer models, but real-world reports of
+    # the RC2's own mission UI destabilizing on mapping-style missions --
+    # many closely-packed points, exactly what a grid survey produces --
+    # describe trouble starting around 70+, independent of this app or any
+    # multi-battery concern. 90 stays safely under both. Editable, since
+    # tolerances vary by RC2 firmware version and mission shape.
+    'maxWaypointsPerFile': 90,
+    # Grid/corridor missions no longer put a real waypoint at every photo --
+    # confirmed (DJI's own consumer waypoint docs, and independent real-world
+    # reports) that distance/time-interval WPML photo triggers aren't reliably
+    # available on consumer DJI Fly, and that per-photo stop-and-shoot
+    # waypoints cause both position-hold jitter and RC2 mission-count
+    # instability. Instead: fly each row as one continuous line at a speed
+    # derived from this fixed interval (forward_spacing / cameraInterval), and
+    # set the camera's own Timer/interval-shooting mode to this value manually
+    # before starting the mission -- the app can prompt for that step but
+    # can't do it for you, since it isn't something a WPML file can encode for
+    # consumer hardware. 2.0s matches the workflow HOT's drone-flightplan (a
+    # production tool used for real humanitarian drone mapping) documents for
+    # exactly this purpose, and is comfortably within every DJI camera's
+    # continuous-shooting capability even at high resolution/RAW.
+    'cameraInterval': 2.0,
     'flyToWaylineMode': 'safely', 'finishAction': 'goHome',
     'exitOnRCLost': 'executeLostAction', 'executeRCLostAction': 'goBack',
     'takeOffSecurityHeight': 20, 'globalTransitionalSpeed': 10,
@@ -412,19 +435,27 @@ def _point_in_polygon(x, y, poly):
 def _in_any_polygon(x, y, polys):
     return any(_point_in_polygon(x, y, p) for p in polys) if polys else False
 
-def _sweep_coverage(rpts, side_spacing, forward_spacing, exclude_polys=None):
+def _sweep_coverage_rows(rpts, side_spacing, forward_spacing, exclude_polys=None):
     """Boustrophedon (lawnmower) sweep across the polygon's bounding box, keeping
     only in-polygon sample points and snapping each row's last point out to the
-    true edge so rows don't stop short. Each sample point becomes a photo
-    waypoint, so spacing directly controls how many photos the mission takes.
+    true edge so rows don't stop short. Returns a list of ROWS (each a list of
+    dense sample points), not a flat list -- see _sweep_coverage for the flat
+    version used for photo-count/estimate math, and generate_grid for why the
+    actual flight path only uses each row's endpoints rather than every dense
+    sample point (real per-photo waypoints, one stop-and-hold per shot, is what
+    caused position-hold jitter and RC2 mission-count instability in practice;
+    see this function's row output used there for the real fix).
     exclude_polys is a list of hole polygons (same coordinate frame as rpts) —
     a sample point inside any of them is skipped, same as if it were outside
-    the outer boundary."""
+    the outer boundary. This can split a single scan row into disconnected
+    stretches of coverage, which is why each row is kept as its own list
+    instead of a flat stream: generate_grid needs the gaps to know where a
+    straight line between two points would cut through a no-fly zone."""
     xs = [p[0] for p in rpts]
     ys = [p[1] for p in rpts]
     minx, maxx = min(xs), max(xs)
     miny, maxy = min(ys), max(ys)
-    pts = []
+    rows = []
     reverse = False
     y = miny
     while y <= maxy + 1e-9:
@@ -439,10 +470,35 @@ def _sweep_coverage(rpts, side_spacing, forward_spacing, exclude_polys=None):
             line.append((maxx, y))
         if reverse:
             line.reverse()
-        pts.extend(line)
+        if line:
+            rows.append(line)
         reverse = not reverse
         y += side_spacing
-    return pts
+    return rows
+
+def _sweep_coverage(rpts, side_spacing, forward_spacing, exclude_polys=None):
+    """Flat dense sample list -- the real per-photo positions, used for photo-
+    count/area/interval estimates (and by the JS live-estimate mirror). The
+    actual flight path generate_grid builds does NOT fly to each of these; see
+    _sweep_coverage_rows."""
+    rows = _sweep_coverage_rows(rpts, side_spacing, forward_spacing, exclude_polys)
+    return [pt for row in rows for pt in row]
+
+def _split_row_gaps(row, forward_spacing):
+    """A row can have gaps where a no-fly zone cut through it -- detect a jump
+    much bigger than the normal sample spacing and split into separate
+    flyable segments, so a sparse start/end waypoint pair never draws a
+    straight line through an excluded area."""
+    if not row:
+        return []
+    gap = forward_spacing * 1.5
+    segments = [[row[0]]]
+    for i in range(1, len(row)):
+        dx, dy = row[i][0] - row[i - 1][0], row[i][1] - row[i - 1][1]
+        if math.hypot(dx, dy) > gap:
+            segments.append([])
+        segments[-1].append(row[i])
+    return segments
 
 def _project_exclusions(exclusions_latlon, ref_lat, ref_lon, cf, sf):
     """Exclusion polygons come in as plain lat/lon like the boundary — reproject
@@ -455,6 +511,30 @@ def _project_exclusions(exclusions_latlon, ref_lat, ref_lon, cf, sf):
         exy = [to_xy(p[0], p[1], ref_lat, ref_lon) for p in excl]
         out.append([(x * cf - y * sf, x * sf + y * cf) for x, y in exy])
     return out
+
+def grid_photo_points(polygon_latlon, cfg, exclusions_latlon=None):
+    """Dense per-photo sample points for a grid area -- the same geometry
+    generate_grid uses to lay out its sparse row-turn flight path, flattened
+    here for counting/estimating instead. Used for the photo-count estimate
+    and for excluded_count (how many shots a no-fly zone would actually
+    remove), since generate_grid's own output is no longer one entry per
+    photo -- see its comment for why."""
+    if len(polygon_latlon) < 3:
+        return []
+    ref_lat = sum(p[0] for p in polygon_latlon) / len(polygon_latlon)
+    ref_lon = sum(p[1] for p in polygon_latlon) / len(polygon_latlon)
+    pts_xy = [to_xy(p[0], p[1], ref_lat, ref_lon) for p in polygon_latlon]
+    side_spacing, forward_spacing = coverage_spacing(cfg)
+    rot = math.radians(cfg.get('rotationDeg', 0) or 0)
+    cf, sf = math.cos(-rot), math.sin(-rot)
+    rpts = [(x * cf - y * sf, x * sf + y * cf) for x, y in pts_xy]
+    exclude_rpolys = _project_exclusions(exclusions_latlon, ref_lat, ref_lon, cf, sf)
+    pts = _sweep_coverage(rpts, side_spacing, forward_spacing, exclude_rpolys)
+    if cfg.get('crosshatch'):
+        transposed = [(y, x) for x, y in rpts]
+        transposed_excl = [[(y, x) for x, y in poly] for poly in exclude_rpolys]
+        pts += _sweep_coverage(transposed, side_spacing, forward_spacing, transposed_excl)
+    return pts
 
 def generate_grid(polygon_latlon, cfg, exclusions_latlon=None):
     if len(polygon_latlon) < 3:
@@ -471,26 +551,47 @@ def generate_grid(polygon_latlon, cfg, exclusions_latlon=None):
     rpts = [(x * cf - y * sf, x * sf + y * cf) for x, y in pts_xy]
     exclude_rpolys = _project_exclusions(exclusions_latlon, ref_lat, ref_lon, cf, sf)
 
-    pts = _sweep_coverage(rpts, side_spacing, forward_spacing, exclude_rpolys)
+    rows = _sweep_coverage_rows(rpts, side_spacing, forward_spacing, exclude_rpolys)
     if cfg.get('crosshatch'):
         # A second sweep at 90° catches gaps the first sweep's direction misses,
         # especially on concave/irregular site boundaries — appended as a second
         # pass rather than interleaved, so it always runs after the main grid.
         transposed = [(y, x) for x, y in rpts]
         transposed_excl = [[(y, x) for x, y in poly] for poly in exclude_rpolys]
-        pts2 = _sweep_coverage(transposed, side_spacing, forward_spacing, transposed_excl)
-        pts += [(x, y) for y, x in pts2]
+        rows2 = _sweep_coverage_rows(transposed, side_spacing, forward_spacing, transposed_excl)
+        rows += [[(x, y) for y, x in row] for row in rows2]
 
-    if not pts:
+    if not rows:
         raise ValueError('No coverage generated — the area may be too small for the current spacing/altitude')
 
+    # Real per-photo waypoints (one navigational stop per shot) is what caused
+    # position-hold jitter and RC2 mission-count instability in real flight
+    # testing -- confirmed as a known failure mode independent of this app
+    # (Litchi forum reports of the RC2's mission UI destabilizing on mapping
+    # missions with many closely-packed points, and DJI Fly's own consumer
+    # waypoint docs only support discrete stop-and-shoot actions, not a
+    # continuous-flight interval trigger). The actual practice real drone-
+    # mapping tools use instead (confirmed independently by HOT's
+    # drone-flightplan, used for production humanitarian mapping): fly each
+    # row as one continuous straight line and let the camera's own fixed-
+    # interval timer (set manually before the flight -- can't be encoded in
+    # the WPML file) fire the shutter throughout. Cruise speed is derived FROM
+    # that fixed interval, not the other way around, so a photo actually lands
+    # every forward_spacing meters. See cameraInterval's comment in
+    # DEFAULT_MISSION_CONFIG.
+    camera_interval = cfg.get('cameraInterval') or 2.0
+    row_speed = max(0.5, forward_spacing / camera_interval)
+
     waypoints = []
-    for x, y in pts:
-        lx, ly = x * ci - y * si, x * si + y * ci
-        lat, lon = from_xy(lx, ly, ref_lat, ref_lon)
-        waypoints.append({'lat': lat, 'lon': lon, 'alt': cfg['altitude'], 'speed': cfg['speed'],
-                           'gimbal': cfg.get('gimbalPitch', -90), 'heading_mode': 'followWayline',
-                           'photo': True, 'hover': cfg.get('delayAtWaypoint', 0)})
+    for row in rows:
+        for seg in _split_row_gaps(row, forward_spacing):
+            endpoints = [seg[0]] if len(seg) < 2 else [seg[0], seg[-1]]
+            for x, y in endpoints:
+                lx, ly = x * ci - y * si, x * si + y * ci
+                lat, lon = from_xy(lx, ly, ref_lat, ref_lon)
+                waypoints.append({'lat': lat, 'lon': lon, 'alt': cfg['altitude'], 'speed': row_speed,
+                                   'gimbal': cfg.get('gimbalPitch', -90), 'heading_mode': 'followWayline',
+                                   'photo': False, 'hover': 0})
     return waypoints
 
 def generate_3d_mapping(polygon_latlon, cfg, exclusions_latlon=None):
@@ -510,9 +611,29 @@ def generate_3d_mapping(polygon_latlon, cfg, exclusions_latlon=None):
 
     return nadir_pts + oblique_pts
 
-def generate_corridor(line_latlon, cfg, exclusions_latlon=None):
+def mission_photo_points(polygon_latlon, cfg, exclusions_latlon=None):
+    """grid_photo_points, but also handles the 3D-mapping (nadir+oblique
+    double-grid) case the same way generate_3d_mapping itself splits cfg."""
+    if not cfg.get('threeDMapping'):
+        return grid_photo_points(polygon_latlon, cfg, exclusions_latlon)
+    nadir_cfg = dict(cfg)
+    nadir_cfg['gimbalPitch'] = -90
+    nadir_cfg['crosshatch'] = False
+    oblique_cfg = dict(cfg)
+    oblique_cfg['rotationDeg'] = (cfg.get('rotationDeg', 0) + 90) % 360
+    oblique_cfg['crosshatch'] = False
+    return (grid_photo_points(polygon_latlon, nadir_cfg, exclusions_latlon)
+            + grid_photo_points(polygon_latlon, oblique_cfg, exclusions_latlon))
+
+def corridor_photo_points(line_latlon, cfg, exclusions_latlon=None):
+    """Dense per-photo sample points for every pass of a corridor, plus the
+    bits generate_corridor needs to turn them into a sparse flight path
+    (ref point, forward spacing). Split out so the photo-count estimate and
+    excluded_count can share this with generate_corridor instead of
+    duplicating the sampling math -- see grid_photo_points for the grid
+    equivalent."""
     if len(line_latlon) < 2:
-        raise ValueError('A corridor route needs at least 2 points')
+        return [], (0, 0), 1.0
     ref_lat, ref_lon = line_latlon[0][0], line_latlon[0][1]
     pts_xy = [to_xy(p[0], p[1], ref_lat, ref_lon) for p in line_latlon]
     # cf=1, sf=0 is an identity rotation -- corridor coverage doesn't rotate
@@ -555,18 +676,44 @@ def generate_corridor(line_latlon, cfg, exclusions_latlon=None):
         heading = math.atan2(x2 - x1, y2 - y1)
         samples.append((x, y, heading))
 
-    waypoints = []
+    passes = []
     for pass_i, off in enumerate(offsets):
         pass_samples = samples if pass_i % 2 == 0 else list(reversed(samples))
+        pass_xy = []
         for x, y, heading in pass_samples:
             perp = heading + math.pi / 2
             ox, oy = x + off * math.sin(perp), y + off * math.cos(perp)
             if _in_any_polygon(ox, oy, exclude_xypolys):
                 continue
-            lat, lon = from_xy(ox, oy, ref_lat, ref_lon)
-            waypoints.append({'lat': lat, 'lon': lon, 'alt': cfg['altitude'], 'speed': cfg['speed'],
-                               'gimbal': cfg.get('gimbalPitch', -90), 'heading_mode': 'followWayline',
-                               'photo': True, 'hover': 0})
+            pass_xy.append((ox, oy))
+        passes.append(pass_xy)
+    return passes, (ref_lat, ref_lon), forward_spacing
+
+def generate_corridor(line_latlon, cfg, exclusions_latlon=None):
+    passes, (ref_lat, ref_lon), forward_spacing = corridor_photo_points(line_latlon, cfg, exclusions_latlon)
+    if len(line_latlon) < 2:
+        raise ValueError('A corridor route needs at least 2 points')
+    if not any(passes):
+        raise ValueError('No coverage generated — the route may be too short, or fully inside a no-fly zone')
+
+    # Same reasoning as generate_grid: a real per-photo waypoint every
+    # forward_spacing meters is what caused position-hold jitter and RC2
+    # mission-count instability in practice. Each pass flies as one
+    # continuous line at a speed derived from the camera's own fixed
+    # interval-shooting timer instead. See generate_grid's comment and
+    # cameraInterval's comment in DEFAULT_MISSION_CONFIG.
+    camera_interval = cfg.get('cameraInterval') or 2.0
+    row_speed = max(0.5, forward_spacing / camera_interval)
+
+    waypoints = []
+    for pass_xy in passes:
+        for seg in _split_row_gaps(pass_xy, forward_spacing):
+            endpoints = [seg[0]] if len(seg) < 2 else [seg[0], seg[-1]]
+            for ox, oy in endpoints:
+                lat, lon = from_xy(ox, oy, ref_lat, ref_lon)
+                waypoints.append({'lat': lat, 'lon': lon, 'alt': cfg['altitude'], 'speed': row_speed,
+                                   'gimbal': cfg.get('gimbalPitch', -90), 'heading_mode': 'followWayline',
+                                   'photo': False, 'hover': 0})
     return waypoints
 
 def generate_orbit(center_lat, center_lon, cfg):
@@ -643,7 +790,7 @@ def estimate_coverage(polygon_latlon, cfg):
         return {'side_spacing': 0, 'forward_spacing': 0, 'passes': 0, 'estimated_photos': 0,
                 'area_m2': 0, 'shutter_speed': None, 'forward_interval_s': 0}
     side_spacing, forward_spacing = coverage_spacing(cfg)
-    pts = generate_grid(polygon_latlon, cfg)
+    pts = grid_photo_points(polygon_latlon, cfg)
     passes = max(1, round(polygon_area_m2(polygon_latlon) ** 0.5 / side_spacing))
     shutter = recommended_shutter_speed(cfg['altitude'], cfg['sensor_w'], cfg['focal'], cfg['img_w'], cfg['speed'])
     interval = forward_spacing / cfg['speed'] if cfg.get('speed') else 0
@@ -686,11 +833,19 @@ def leg_time_sec(dist_m, cruise_speed, accel, must_stop):
     return 2 * math.sqrt(dist_m / accel)
 
 def split_mission_by_battery(waypoints, cfg):
-    """Greedily group waypoints into flight-time-budgeted batches, each a
-    standalone sub-mission: fly it, swap battery, load the next one."""
+    """Greedily group waypoints into standalone sub-missions, breaking a batch
+    whenever EITHER limit is hit first: flight-time budget (swap battery, load
+    the next one) or waypoint count. The waypoint-count limit exists because
+    DJI Fly enforces a hard per-file cap (200 waypoints, confirmed current for
+    the Mini 5 Pro) and real-world reports (independent of this app -- see
+    maxWaypointsPerFile's comment in DEFAULT_MISSION_CONFIG) describe the RC2's
+    own mission UI destabilizing well before that on mapping-style missions
+    with many closely-packed points, which is exactly the shape of mission a
+    grid survey produces."""
     if not waypoints:
         return []
     budget = usable_battery_seconds(cfg)
+    max_wps = max(1, int(cfg.get('maxWaypointsPerFile', 90) or 90))
     accel = cfg.get('droneAccel', 1.4)
     default_turn = cfg.get('turnMode', 'toPointAndStopWithDiscontinuityCurvature')
     batches = []
@@ -703,7 +858,7 @@ def split_mission_by_battery(waypoints, cfg):
         must_stop = (_is_stop_turn(prev_wp.get('turn_mode', default_turn))
                      or _is_stop_turn(wp.get('turn_mode', default_turn)))
         leg = leg_time_sec(dist, speed, accel, must_stop) + (wp.get('hover', 0) or 0)
-        if elapsed + leg > budget and current:
+        if current and (elapsed + leg > budget or len(current) >= max_wps):
             batches.append(current)
             current = []
             elapsed = 0
@@ -1226,20 +1381,23 @@ class Api:
         try:
             fn = generate_3d_mapping if cfg.get('threeDMapping') else generate_grid
             wps = fn(polygon, cfg, exclusions)
+            photos = len(mission_photo_points(polygon, cfg, exclusions))
             excluded = 0
             if exclusions:
-                excluded = max(0, len(fn(polygon, cfg, None)) - len(wps))
-            return {'ok': True, 'waypoints': wps, 'excluded_count': excluded}
+                excluded = max(0, len(mission_photo_points(polygon, cfg, None)) - photos)
+            return {'ok': True, 'waypoints': wps, 'excluded_count': excluded, 'estimated_photos': photos}
         except Exception as e:
             return {'ok': False, 'msg': str(e)}
 
     def generate_corridor(self, line, cfg, exclusions=None):
         try:
             wps = generate_corridor(line, cfg, exclusions)
+            photos = sum(len(p) for p in corridor_photo_points(line, cfg, exclusions)[0])
             excluded = 0
             if exclusions:
-                excluded = max(0, len(generate_corridor(line, cfg, None)) - len(wps))
-            return {'ok': True, 'waypoints': wps, 'excluded_count': excluded}
+                excluded_photos = sum(len(p) for p in corridor_photo_points(line, cfg, None)[0])
+                excluded = max(0, excluded_photos - photos)
+            return {'ok': True, 'waypoints': wps, 'excluded_count': excluded, 'estimated_photos': photos}
         except Exception as e:
             return {'ok': False, 'msg': str(e)}
 
@@ -1795,6 +1953,11 @@ var pendingKind = null;      // 'grid'|'corridor'|'orbit' — the source shape f
 var pendingGeom = null;
 var pendingGenerated = false; // true once this pending shape has been generated at least once
 var missionName = 'Mission';  // prompted at the start of each mission, used as the export filename prefix
+// Grid/corridor waypoints no longer carry photo:true per shot (camera fires
+// on its own interval timer during continuous flight -- see generate_grid's
+// Python comment), so the dense photo-count estimate the server computed at
+// generation time is tracked separately here for display purposes.
+var lastEstimatedPhotos = 0;
 var exclusionZones = []; // [{coords:[[lat,lon],...]}] — no-fly holes a grid mission skips
 var gcpPoints = [];       // [{lat,lon,label}] — ground control points, exported separately, never flown to
 
@@ -1924,18 +2087,32 @@ function refreshEstimate(){
   else if(pendingKind==='corridor') est=estimateCorridor(pendingGeom, cfg);
   if(!est){ el.innerHTML=''; return; }
   var shutter=recommendedShutterSpeed(cfg);
-  var interval=cfg.speed ? (est.forward/cfg.speed) : 0;
-  // Real waypoints don't exist yet at this point (pre-generation estimate), so
-  // model N-1 legs of roughly est.forward each, accel-aware the same way the
-  // real per-waypoint calculation is -- a flat distance/speed here would repeat
-  // the same undercount a tightly-spaced grid runs into once actually generated.
-  var legCount = Math.max(0, est.photos-1);
-  var mustStop = isStopTurn(cfg.turnMode);
-  var flightSec = legCount * legTimeSec(est.forward, cfg.speed||1, cfg.droneAccel, mustStop);
+  var camInterval = cfg.cameraInterval||2.0;
+  var rowSpeed = Math.max(0.5, Number(est.forward)/camInterval);
+  var interval=camInterval;
+  // Real waypoints are sparse (row endpoints only, continuous cruise within
+  // each row at rowSpeed, derived from the camera's own fixed interval timer)
+  // instead of one stop per photo -- see generate_grid's Python comment for
+  // why. Model total covered distance as continuous cruise at rowSpeed, plus
+  // one brief accel/decel row-turn per pass (side-spacing hop, always a real
+  // stop since that's an actual direction reversal).
+  var totalDist = Math.max(0, est.photos-1) * Number(est.forward);
+  var turns = Math.max(0, (est.passes||1) - 1);
+  var turnSec = turns * legTimeSec(Number(est.side)||Number(est.forward), rowSpeed, cfg.droneAccel, true);
+  var flightSec = totalDist/rowSpeed + turnSec;
   var usableSec = usableBatteryMinutes(cfg)*60;
-  var batteries = Math.max(1, Math.ceil(flightSec/usableSec));
-  var warn = batteries>1
-    ? '<div class="hint warn">&#128267; ~'+batteries+' batteries needed at this size &mdash; use "Export by Battery" after generating to split automatically, or lower overlap/raise altitude to shrink it.</div>' : '';
+  var battBatches = Math.max(1, Math.ceil(flightSec/usableSec));
+  // Real waypoint count for grid/corridor is sparse now (row endpoints only,
+  // roughly 2 per pass) -- see generate_grid's comment. That's what the RC2's
+  // per-file limit actually applies to, not the dense photo count.
+  var estWpCount = pendingKind==='grid' ? (est.passes||1)*2 : est.photos;
+  var wpBatches = Math.max(1, Math.ceil(estWpCount/(cfg.maxWaypointsPerFile||90)));
+  var batches = Math.max(battBatches, wpBatches);
+  var warnWhy = wpBatches>battBatches ? '~'+estWpCount+' waypoints is over the safe per-file limit' : '~'+batches+' batteries needed at this size';
+  var warn = batches>1
+    ? '<div class="hint warn">&#128267; '+warnWhy+' &mdash; use "Export by Battery" after generating to split automatically, or lower overlap/raise altitude to shrink it.</div>' : '';
+  var camNote = pendingKind==='grid' ?
+    '<div class="hint" style="color:var(--orange2);">&#128247; Before flying: set the camera to Timer/interval shooting at <b>'+camInterval.toFixed(1)+'s</b>, then fly this mission at <b>~'+rowSpeed.toFixed(1)+' m/s</b> &mdash; that combination is what actually gets you '+est.forward+'m photo spacing (see the &#63; on Camera interval under Advanced for why this can\'t be automated).</div>' : '';
   var extraStats = '<div class="hint">' +
     (areaM2 ? 'Area <b>'+(areaM2>=10000?(areaM2/10000).toFixed(2)+' ha':Math.round(areaM2)+' m&sup2;')+'</b> &middot; ' : '') +
     'Photo interval <b>~'+interval.toFixed(1)+'s</b>' +
@@ -1944,7 +2121,7 @@ function refreshEstimate(){
     '</div>';
   el.innerHTML = '<div class="hint">Line spacing <b>'+est.side+'m</b> &middot; photo spacing <b>'+est.forward+'m</b> &middot; '+est.passes+' pass(es)</div>' +
     '<div style="font-size:16px;color:var(--orange);font-weight:700;margin:4px 0;">~'+est.photos+' photos (estimate)</div>' +
-    extraStats + warn;
+    extraStats + camNote + warn;
 }
 
 var map = L.map('map', {preferCanvas:true}).setView([45.35,22.28], 12);
@@ -2131,7 +2308,7 @@ function renderSetup(){
       '<div class="field"><label>Altitude (m AGL)</label><input type="number" value="'+cfg.altitude+'" onchange="cfg.altitude=parseFloat(this.value)||10;refreshEstimate()"></div>' +
       '<div class="field"><label>Speed (m/s)</label><input type="number" value="'+cfg.speed+'" onchange="cfg.speed=parseFloat(this.value)||1"></div>' +
     '</div>' +
-    '<div class="field"><label>Delay at each waypoint (sec, 0=none)'+help('The aircraft moves on once it considers the photo action done, which in real-world reports is roughly "shutter fired," not "confirmed written to the card" -- on a slow card, or shooting RAW/DNG, that can mean a skipped photo the mission never notices. If you\'re seeing gaps, this delay is the fix: 1-2s is usually enough for JPEG on a fast card, several seconds for RAW on a slow one.')+'</label><input type="number" min="0" value="'+cfg.delayAtWaypoint+'" onchange="cfg.delayAtWaypoint=parseFloat(this.value)||0"></div>' +
+    '<div class="field"><label>Delay at each waypoint (sec, 0=none)'+help('Only applies to Orbit, Manual, and the Overview lap -- those still take one discrete photo per waypoint, and the aircraft moves on once it considers that action done, which in real-world reports is roughly "shutter fired," not "confirmed written to the card." On a slow card, or shooting RAW/DNG, that can mean a skipped photo the mission never notices; 1-2s is usually enough for JPEG on a fast card, several seconds for RAW on a slow one. Grid/corridor missions don\'t stop per shot at all now (see Camera interval under Advanced), so this has no effect on those.')+'</label><input type="number" min="0" value="'+cfg.delayAtWaypoint+'" onchange="cfg.delayAtWaypoint=parseFloat(this.value)||0"></div>' +
     '</div>' +
 
     // ── Battery & endurance — drives automatic mission splitting ──
@@ -2166,7 +2343,7 @@ function renderSetup(){
       '<button style="width:100%;margin-top:2px;" onclick="autoRotate()" title="Align the sweep to the area\'s longest edge, minimizing wasted transit distance">&#8635; Auto-rotate to minimize flight distance</button>' +
       '<div class="field" style="margin-top:6px;"><label>Wind from (&deg;, optional)</label><input id="wind-dir" type="number" min="0" max="359" placeholder="e.g. 270"></div>' +
       '<button style="width:100%;margin-top:2px;" onclick="rotateForWind()" title="Coverage-path research (e.g. Boustrophedon CPP for UAV surveys in wind) finds sweeping parallel to the wind, not across it, covers faster with steadier speed and less battery spent fighting a crosswind every pass. Enter the direction wind is coming FROM above, if you know it.">&#8634; Align to wind</button>' +
-      '<div class="field" style="margin-top:8px;"><label>Turn style'+help('Stopping at each point keeps camera position/GSD consistent for photogrammetry -- the standard choice for mapping. Smooth flythrough covers ground faster but can blur shots taken mid-turn.')+'</label><select onchange="cfg.turnMode=this.value">' +
+      '<div class="field" style="margin-top:8px;"><label>Turn style'+help('Waypoints are now only at each row\'s start/end (see Camera interval under Advanced), so this only affects that row-to-row turn, not individual photos -- stopping to reverse direction between rows is standard photogrammetry practice and won\'t cause the position-hold jitter a stop would mid-row. Smooth flythrough banks through the turn instead of stopping, saving a little time but overshooting the row start slightly.')+'</label><select onchange="cfg.turnMode=this.value">' +
         opt('toPointAndStopWithDiscontinuityCurvature',cfg.turnMode,'Stop at each point (precise — recommended for mapping)')+
         opt('toPointAndStopWithContinuityCurvature',cfg.turnMode,'Slow smooth turn, still stops')+
         opt('toPointAndPassWithContinuityCurvature',cfg.turnMode,'Smooth flythrough, never stops')+
@@ -2238,6 +2415,8 @@ function renderSetup(){
       '</div>' +
       '<div class="field"><label>Image height (px)</label><input type="number" value="'+cfg.img_h+'" onchange="cfg.img_h=parseInt(this.value)||1;refreshEstimate()"></div>' +
       '<div class="field" style="margin-top:8px;"><label>Accel/decel (m/s&sup2;)'+help('Used to estimate real flight time and battery-split points -- distance/speed alone assumes the aircraft is instantly at cruise speed and stops instantly, which overstates how fast a tightly-spaced stop-and-rotate grid actually flies. 1.4 m/s&sup2; is a measured average for a small quadcopter (Xu et al., 2021, MDPI Drones journal); lower it for a heavily-loaded aircraft, raise it if yours feels snappier in Sport-like modes.')+'</label><input type="number" step="0.1" min="0.1" value="'+cfg.droneAccel+'" onchange="cfg.droneAccel=parseFloat(this.value)||1.4;refreshEstimate()"></div>' +
+      '<div class="field" style="margin-top:8px;"><label>Max waypoints per file'+help('DJI Fly currently caps a single mission file at 200 waypoints on the Mini 5 Pro and other current consumer models, but real-world reports describe the RC2\'s own mission UI destabilizing well before that on mapping-style missions with many closely-packed points -- exactly what a grid survey produces. 90 stays safely under both; lower it further if your RC2 still struggles, raise it (up to 200) if it handles more without issue.')+'</label><input type="number" min="1" max="200" value="'+cfg.maxWaypointsPerFile+'" onchange="cfg.maxWaypointsPerFile=parseInt(this.value)||90;refreshEstimate()"></div>' +
+      '<div class="field" style="margin-top:8px;"><label>Camera interval (sec)'+help('Grid/corridor missions no longer stop at every photo (that caused position-hold jitter and RC2 instability -- see the Waypoints-tab warning after generating). Instead the camera\'s own Timer/interval-shooting mode fires the shutter throughout continuous flight, and this app derives cruise speed FROM this fixed interval so photos still land at the right spacing. It cannot set this on the camera for you -- WPML distance/time photo triggers aren\'t reliably supported on consumer DJI Fly (confirmed: documented as enterprise-drone-only, and real-world reports of it simply not working over RC2 KMZ import). You MUST set this manually on the camera before every flight. 2.0s matches HOT\'s drone-flightplan, a production tool used for real humanitarian drone mapping.')+'</label><input type="number" step="0.1" min="0.5" value="'+cfg.cameraInterval+'" onchange="cfg.cameraInterval=parseFloat(this.value)||2.0;refreshEstimate()"></div>' +
     '</div></details></div>' +
 
     // ── Safety & mission behaviour — sane defaults, rarely touched ──
@@ -2536,10 +2715,13 @@ function discardPending(){
 // committing to that, and re-fetches an unfiltered result if the user would
 // rather ignore the zone(s) for this particular mission.
 function confirmExclusionDrop(res, regenerateWithoutExclusions){
-  if(!res.excluded_count){ return Promise.resolve(res.waypoints); }
+  // Resolves with the whole res object (not just .waypoints) so callers can
+  // also read estimated_photos -- dense photo count no longer equals
+  // waypoint count for grid/corridor, see generate_grid's Python comment.
+  if(!res.excluded_count){ return Promise.resolve(res); }
   var msg = res.excluded_count+' waypoint(s) fall inside a marked no-fly zone and were left out.\n\n'+
     'OK — keep them left out (recommended)\nCancel — ignore the no-fly zone(s) for this mission and generate it anyway';
-  if(confirm(msg)) return Promise.resolve(res.waypoints);
+  if(confirm(msg)) return Promise.resolve(res);
   return regenerateWithoutExclusions();
 }
 
@@ -2551,8 +2733,8 @@ function mergeOverviewIfEnabled(polygonForOverview){
   return pywebview.api.generate_overview(polygonForOverview, cfg, exclusions).then(function(res){
     if(!res.ok) return;
     return confirmExclusionDrop(res, function(){
-      return pywebview.api.generate_overview(polygonForOverview, cfg, []).then(r=>r.waypoints);
-    }).then(function(wps){ waypoints = waypoints.concat(wps); });
+      return pywebview.api.generate_overview(polygonForOverview, cfg, []);
+    }).then(function(r){ waypoints = waypoints.concat(r.waypoints); });
   });
 }
 
@@ -2564,12 +2746,14 @@ function generateGridMission(polygon){
   pywebview.api.generate_grid(polygon, cfg, exclusions).then(function(res){
     if(!res.ok){ hideProgress(); alert('Grid generation failed: '+res.msg); return; }
     confirmExclusionDrop(res, function(){
-      return pywebview.api.generate_grid(polygon, cfg, []).then(r=>r.waypoints);
-    }).then(function(wps){
-      waypoints = wps; pois=[]; selectedWpIdx=null; pendingGenerated=true;
+      return pywebview.api.generate_grid(polygon, cfg, []);
+    }).then(function(r){
+      waypoints = r.waypoints; lastEstimatedPhotos = r.estimated_photos||0;
+      pois=[]; selectedWpIdx=null; pendingGenerated=true;
       mergeOverviewIfEnabled(polygon).then(function(){
         hideProgress();
-        renderWaypoints(); showTab('waypoints'); setStatus(waypoints.length+' waypoints generated');
+        renderWaypoints(); showTab('waypoints');
+        setStatus(waypoints.length+' waypoints (~'+lastEstimatedPhotos+' photos) generated');
       });
     });
   });
@@ -2580,11 +2764,13 @@ function generateCorridorMission(line){
   pywebview.api.generate_corridor(line, cfg, exclusions).then(function(res){
     if(!res.ok){ hideProgress(); alert('Corridor generation failed: '+res.msg); return; }
     confirmExclusionDrop(res, function(){
-      return pywebview.api.generate_corridor(line, cfg, []).then(r=>r.waypoints);
-    }).then(function(wps){
+      return pywebview.api.generate_corridor(line, cfg, []);
+    }).then(function(r){
       hideProgress();
-      waypoints = wps; pois=[]; selectedWpIdx=null; pendingGenerated=true;
-      renderWaypoints(); showTab('waypoints'); setStatus(waypoints.length+' waypoints generated');
+      waypoints = r.waypoints; lastEstimatedPhotos = r.estimated_photos||0;
+      pois=[]; selectedWpIdx=null; pendingGenerated=true;
+      renderWaypoints(); showTab('waypoints');
+      setStatus(waypoints.length+' waypoints (~'+lastEstimatedPhotos+' photos) generated');
     });
   });
 }
@@ -2689,7 +2875,16 @@ function renderWaypointsTab(){
       '<td><span class="del-btn" onclick="event.stopPropagation();deleteWaypoint('+i+')">&#10005;</span></td>' +
     '</tr>';
   }).join('');
-  el.innerHTML = replayPanelHtml() +
+  var camReminder = '';
+  if(pendingKind==='grid' || pendingKind==='corridor'){
+    var ci = cfg.cameraInterval||2.0;
+    var rowSpd = waypoints.find(w=>!w.photo && w.speed) ? waypoints[0].speed : null;
+    camReminder = '<div class="hint warn" style="margin-bottom:8px;padding:8px 10px;border:1px solid var(--orange-dim);border-radius:var(--radius-sm);background:#1c1300;">' +
+      '&#128247; <b>Before you fly:</b> set the camera to Timer/interval shooting at <b>'+ci.toFixed(1)+'s</b>'+
+      (rowSpd?' and confirm cruise speed is ~<b>'+rowSpd.toFixed(1)+' m/s</b>':'')+
+      ' &mdash; these waypoints don\'t carry per-shot photo actions on purpose (see Camera interval under Setup &rarr; Advanced for why).</div>';
+  }
+  el.innerHTML = replayPanelHtml() + camReminder +
     '<div class="row" style="margin-bottom:8px;">' +
       '<button onclick="applyTerrainFollow()" title="Looks up ground elevation under every waypoint (needs internet) and shifts each altitude so real height above ground stays constant over sloped terrain, instead of a flat plane from the first waypoint">&#9968; Apply terrain-following altitude</button>' +
     '</div>' +
@@ -2719,15 +2914,27 @@ function deleteWaypoint(i){
 function updateStats(){
   var dist=0;
   for(var i=1;i<waypoints.length;i++){ dist += haversine(waypoints[i-1].lat,waypoints[i-1].lon,waypoints[i].lat,waypoints[i].lon); }
-  var photoCount = waypoints.filter(w=>w.photo).length;
+  // Grid/corridor waypoints carry photo:false now (the camera's own interval
+  // timer takes the shots, not a per-waypoint action -- see generate_grid's
+  // Python comment), so their dense estimate is added back in here; any
+  // photo:true points still present (an appended overview lap, or an orbit/
+  // manual mission, which are unaffected by this) count normally.
+  var isDenseKind = pendingKind==='grid' || pendingKind==='corridor';
+  var photoCount = (isDenseKind ? lastEstimatedPhotos : 0) + waypoints.filter(w=>w.photo).length;
   var flightSec = computeFlightSeconds(waypoints, cfg);
   var mins = Math.floor(flightSec/60), secs = Math.round(flightSec%60);
   var usableSec = usableBatteryMinutes(cfg)*60;
-  var batteries = Math.max(1, Math.ceil(flightSec/usableSec));
-  var battWarn = batteries>1
-    ? '<span style="color:var(--orange2)">&#128267; ~'+batteries+' batteries needed &mdash; use "Export by Battery" to split automatically</span>' : '';
-  var warn = waypoints.length>500
-    ? '<span style="color:var(--orange2)">&#9888; '+waypoints.length+' waypoints is a lot &mdash; consider lowering overlap %, raising altitude, or splitting into multiple missions</span>' : '';
+  var battBatches = Math.max(1, Math.ceil(flightSec/usableSec));
+  var wpBatches = Math.max(1, Math.ceil(waypoints.length/(cfg.maxWaypointsPerFile||90)));
+  var batches = Math.max(battBatches, wpBatches);
+  var battWarn = batches>1
+    ? '<span style="color:var(--orange2)">&#128267; ~'+batches+' files needed ('+(wpBatches>battBatches?'waypoint-count limit':'battery')+') &mdash; use "Export by Battery" to split automatically</span>' : '';
+  // DJI Fly caps a single mission file at 200 waypoints (current Mini 5 Pro
+  // limit) and real-world reports describe the RC2's own mission UI getting
+  // unstable well before that on mapping-style missions -- see
+  // maxWaypointsPerFile's comment in DEFAULT_MISSION_CONFIG (Python).
+  var warn = waypoints.length>(cfg.maxWaypointsPerFile||90)
+    ? '<span style="color:var(--orange2)">&#9888; '+waypoints.length+' waypoints is over the safe per-file limit ('+(cfg.maxWaypointsPerFile||90)+') &mdash; use "Export by Battery" to split it, or lower overlap %/raise altitude to shrink it</span>' : '';
   // Distance/speed alone would say this mission is faster than it really is
   // whenever waypoints are close enough together (relative to cruise speed and
   // Accel/decel under Advanced) that the aircraft keeps stopping and re-
@@ -2986,7 +3193,12 @@ function timestampTag(){
 function buildExportFilename(wps){
   var flightSec = computeFlightSeconds(wps, cfg);
   var mins=Math.floor(flightSec/60), secs=Math.round(flightSec%60);
-  var photoCount = wps.filter(w=>w.photo).length;
+  // Exact for a whole-mission export; a battery/waypoint-count-split batch
+  // falls back to counting photo:true (undercounts for a grid/corridor batch,
+  // since those carry photo:false now -- see updateStats' comment) rather
+  // than trying to apportion the dense estimate per batch.
+  var isDenseKind = (pendingKind==='grid' || pendingKind==='corridor') && wps===waypoints;
+  var photoCount = (isDenseKind ? lastEstimatedPhotos : 0) + wps.filter(w=>w.photo).length;
   return sanitizeMissionName(missionName)+'_'+timestampTag()+'_'+mins+'m'+secs+'s_'+photoCount+'p_'+droneSlug();
 }
 function exportWpml(){
@@ -3079,7 +3291,9 @@ function appendUploadLog(msg, isErr){
 function currentMissionBatteries(){
   var flightSec = computeFlightSeconds(waypoints, cfg);
   var usableSec = usableBatteryMinutes(cfg)*60;
-  return {minutes: flightSec/60, batteries: Math.max(1, Math.ceil(flightSec/usableSec))};
+  var battBatches = Math.max(1, Math.ceil(flightSec/usableSec));
+  var wpBatches = Math.max(1, Math.ceil(waypoints.length/(cfg.maxWaypointsPerFile||90)));
+  return {minutes: flightSec/60, batteries: Math.max(battBatches, wpBatches)};
 }
 function openUploadPicker(){
   if(waypoints.length===0){ alert('No waypoints in the current mission.'); return; }
@@ -3087,11 +3301,15 @@ function openUploadPicker(){
   document.getElementById('picker-log').innerHTML=''; document.getElementById('picker-log').classList.remove('visible');
   document.getElementById('picker-list').innerHTML='<div class="empty-hint">Scanning the controller...</div>';
   var battInfo = currentMissionBatteries();
+  var wpOverLimit = waypoints.length > (cfg.maxWaypointsPerFile||90);
   var warnEl = document.getElementById('picker-battery-warn');
   if(battInfo.batteries>1){
     warnEl.classList.add('visible');
-    warnEl.innerHTML = '&#9888; This mission is ~'+Math.round(battInfo.minutes)+' min &mdash; needs about <b>'+battInfo.batteries+
-      '</b> batteries. Uploading it as-is to one slot means the drone can\'t finish it on a single charge. '+
+    var reason = wpOverLimit
+      ? waypoints.length+' waypoints is over the safe per-file limit for the RC2\'s own mission UI'
+      : '~'+Math.round(battInfo.minutes)+' min needs more than one battery';
+    warnEl.innerHTML = '&#9888; This mission needs <b>'+battInfo.batteries+
+      '</b> separate files ('+reason+'). Uploading it as-is to one slot risks the drone not finishing it, or the RC2 struggling to load it. '+
       'Close this and use <b>Export by Battery</b> instead to split it into '+battInfo.batteries+
       ' separate missions, then upload each one to its own slot.';
   } else {
