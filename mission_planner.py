@@ -1581,9 +1581,18 @@ class Api:
             return {'ok': False, 'msg': str(e)}
 
     def export_gcps(self, gcps, filename=None):
-        # A plain lat/lon CSV, not a flight waypoint file -- GCPs are reference
-        # markers for correcting the orthomosaic afterward in Pix4D/Metashape/
-        # WebODM, all of which import a Label/Latitude/Longitude CSV directly.
+        # A plain CSV, not a flight waypoint file -- GCPs are reference markers
+        # for correcting the orthomosaic afterward in Pix4D/Metashape/WebODM.
+        # Elevation is a real, required field for all three (georeferencing
+        # needs X/Y/Z, not just X/Y -- vertical accuracy matters), which is why
+        # it's here even though nothing else in this app tracks GCP elevation.
+        # Column ORDER (X-first vs Y-first) varies by tool -- Pix4D wants
+        # label,Easting,Northing,z while WebODM wants label,Northing,Easting,
+        # Elevation -- so every real importer has you map columns on import
+        # rather than assume a fixed order; Label/Latitude/Longitude/Elevation
+        # here is the readable default, not a promise it matches any one
+        # tool's exact expected order. Surveyed/Notes are trailing metadata
+        # for your own reference, not something the photogrammetry tools need.
         # They're never written into the WPML export, since DJI Fly would try
         # to fly to them.
         if not gcps:
@@ -1605,10 +1614,13 @@ class Api:
             out += '.csv'
         try:
             with open(out, 'w', encoding='utf-8', newline='') as f:
-                f.write('Label,Latitude,Longitude\n')
+                f.write('Label,Latitude,Longitude,Elevation,Surveyed,Notes\n')
                 for p in gcps:
                     label = str(p.get('label', '')).replace(',', ' ').replace('"', "'")
-                    f.write(f"{label},{p['lat']:.8f},{p['lon']:.8f}\n")
+                    notes = str(p.get('notes', '') or '').replace(',', ';').replace('"', "'").replace('\n', ' ')
+                    surveyed = 'yes' if p.get('surveyed') else 'no'
+                    elevation = p.get('elevation', 0) or 0
+                    f.write(f"{label},{p['lat']:.8f},{p['lon']:.8f},{elevation:.2f},{surveyed},{notes}\n")
             return {'ok': True, 'msg': f'Exported {len(gcps)} ground control point(s) to {os.path.basename(out)}'}
         except Exception as e:
             return {'ok': False, 'msg': str(e)}
@@ -2361,11 +2373,12 @@ function renderSetup(){
     // ── Site markup — no-fly holes and survey-control reference points ──
     '<div class="panel-section"><h4>Site markup</h4>' +
     '<button style="width:100%;" onclick="startDraw(\'exclude\')" title="Draw a hole inside a grid survey area that the flight path skips entirely">&#9888; Draw no-fly zone</button>' +
-    '<button style="width:100%;margin-top:6px;" onclick="startDraw(\'gcp\')" title="Drop reference markers at known coordinates for correcting the orthomosaic afterward in Pix4D/Metashape/WebODM">&#128204; Place GCP</button>' +
+    '<button style="width:100%;margin-top:6px;" onclick="startDraw(\'gcp\')" title="Click roughly where you plan to place a physical ground marker before flying -- you\'ll refine the exact coordinate here once you\'ve measured it in the field.">&#128204; Place GCP</button>' +
     (exclusionZones.length ?
       '<div class="hint" style="margin-top:6px;">'+exclusionZones.length+' no-fly zone(s) active on the current grid area &mdash; '+
       '<a href="#" onclick="clearExclusionZones();return false;">clear all</a></div>' : '') +
-    '<div class="field" style="margin-top:8px;"><label>Ground control points<span style="float:right;">'+
+    '<div class="field" style="margin-top:8px;"><label>Ground control points'+help('A GCP only helps georeferencing once its coordinate is precisely measured, not just clicked on a map. Workflow: place one here roughly where you plan to put a physical marker (checkerboard target, painted cross, survey nail) before flying, spread out for good coverage; after the flight, once you\'ve measured that marker\'s real position with something more accurate than this map -- RTK GPS, a total station, a good handheld unit -- come back, type the precise lat/lon/elevation into the fields below, and tick Surveyed. Only surveyed GCPs are worth feeding into Pix4D/Metashape/WebODM.')+
+      '<span style="float:right;">'+
       (gcpPoints.length ? '<a href="#" onclick="clearGCPs();return false;">clear all</a>' : '')+'</span></label>' +
       '<div id="gcp-list"></div>' +
       (gcpPoints.length ? '<button style="width:100%;margin-top:6px;" onclick="exportGCPs()">&#11123; Export GCPs (.csv)</button>' : '') +
@@ -2808,17 +2821,31 @@ function clearExclusionZones(){
   refreshEstimate();
 }
 
-// ── Ground control points — reference markers exported separately, never flown to ──
+// ── Ground control points ───────────────────────────────────────────────────
+// The real workflow this supports: mark roughly where you plan to put a
+// physical ground marker (checkerboard target, painted cross, survey nail)
+// before flying, spread out for good coverage. After the flight, once you've
+// measured that marker's ACTUAL coordinate with something more precise than
+// a map click -- RTK GPS, a total station, even a good handheld unit -- come
+// back and type the real lat/lon/elevation in here and tick "Surveyed". Only
+// a surveyed GCP is actually worth feeding into Pix4D/Metashape/WebODM for
+// georeferencing; an un-surveyed one is just a planning placeholder, and
+// photogrammetry software genuinely wants X/Y/Z (elevation matters for
+// vertical accuracy, not just horizontal), which is why that field exists
+// here even though nothing else in this app uses elevation this way.
 function addGCP(lat,lon){
   var label = 'GCP'+(gcpPoints.length+1);
-  gcpPoints.push({lat:lat, lon:lon, label:label});
+  gcpPoints.push({lat:lat, lon:lon, elevation:0, notes:'', surveyed:false, label:label});
   redrawGCPs();
 }
 function redrawGCPs(){
   gcpGroup.clearLayers();
   gcpPoints.forEach(function(p,i){
-    L.circleMarker([p.lat,p.lon],{radius:7,color:'#000',weight:1,fillColor:'#2e8fe0',fillOpacity:1})
-      .bindTooltip(p.label, {permanent:true, direction:'top', offset:[0,-8], className:'gcp-label'})
+    L.circleMarker([p.lat,p.lon],{radius:7,color:'#000',weight:1,
+      fillColor: p.surveyed ? '#3fae4b' : '#2e8fe0',
+      fillOpacity: p.surveyed ? 1 : 0.5,
+      dashArray: p.surveyed ? null : '3,2'})
+      .bindTooltip(p.label + (p.surveyed?' (surveyed)':' (planned)'), {permanent:true, direction:'top', offset:[0,-8], className:'gcp-label'})
       .on('click', function(){ renameGCP(i); })
       .addTo(gcpGroup);
   });
@@ -2828,6 +2855,15 @@ function renameGCP(i){
   var name = window.prompt('Label for this GCP:', gcpPoints[i].label);
   if(name!==null && name.trim()!=='') gcpPoints[i].label = name.trim();
   redrawGCPs();
+}
+function updateGCP(i, field, value){
+  var g = gcpPoints[i];
+  if(!g) return;
+  if(field==='lat' || field==='lon' || field==='elevation') g[field] = parseFloat(value) || 0;
+  else if(field==='notes') g.notes = value;
+  else if(field==='surveyed') g.surveyed = !!value;
+  if(field==='lat' || field==='lon') redrawGCPs();
+  else if(field==='surveyed') redrawGCPs();
 }
 function deleteGCP(i){
   gcpPoints.splice(i,1);
@@ -2844,14 +2880,26 @@ function renderGCPList(){
   if(!el) return;
   if(gcpPoints.length===0){ el.innerHTML='<div class="hint">None placed yet.</div>'; return; }
   el.innerHTML = gcpPoints.map(function(p,i){
-    return '<div class="field-row" style="align-items:center;margin-top:4px;">' +
-      '<span style="flex:1;font-size:12px;">'+p.label+' <span style="color:var(--text-faint);">'+p.lat.toFixed(6)+', '+p.lon.toFixed(6)+'</span></span>' +
-      '<span onclick="deleteGCP('+i+')" style="cursor:pointer;color:var(--red);font-weight:bold;opacity:.7;">&#10005;</span>' +
+    return '<div class="layer-item" style="margin-top:6px;">' +
+      '<div class="name" style="justify-content:space-between;">' +
+        '<span onclick="renameGCP('+i+')" style="cursor:pointer;" title="Click to rename">'+p.label+
+          (p.surveyed?' <span style="color:var(--green);font-size:10px;">&#10003; surveyed</span>':' <span style="color:var(--text-faint);font-size:10px;">planned</span>')+'</span>' +
+        '<span onclick="deleteGCP('+i+')" style="cursor:pointer;color:var(--red);font-weight:bold;opacity:.7;">&#10005;</span>' +
+      '</div>' +
+      '<div class="field-row" style="margin-top:4px;">' +
+        '<div class="field"><label style="font-size:9.5px;">Lat</label><input type="number" step="0.000001" value="'+p.lat+'" onchange="updateGCP('+i+',\'lat\',this.value)"></div>' +
+        '<div class="field"><label style="font-size:9.5px;">Lon</label><input type="number" step="0.000001" value="'+p.lon+'" onchange="updateGCP('+i+',\'lon\',this.value)"></div>' +
+        '<div class="field"><label style="font-size:9.5px;">Elev (m)</label><input type="number" step="0.01" value="'+p.elevation+'" onchange="updateGCP('+i+',\'elevation\',this.value)"></div>' +
+      '</div>' +
+      '<div class="field" style="margin-top:4px;"><input type="text" placeholder="Notes -- e.g. painted cross, NE fence corner" value="'+(p.notes||'').replace(/"/g,'&quot;')+'" onchange="updateGCP('+i+',\'notes\',this.value)"></div>' +
+      '<div class="checkbox-row" style="margin-top:4px;margin-bottom:0;"><input type="checkbox" id="gcp-surv-'+i+'" '+(p.surveyed?'checked':'')+' onchange="updateGCP('+i+',\'surveyed\',this.checked)"><label for="gcp-surv-'+i+'">Surveyed (precise measured coordinate, ready to export)</label></div>' +
     '</div>';
   }).join('');
 }
 function exportGCPs(){
   if(!gcpPoints.length){ alert('No ground control points placed yet.'); return; }
+  var unsurveyed = gcpPoints.filter(function(p){ return !p.surveyed; }).length;
+  if(unsurveyed && !confirm(unsurveyed+' of '+gcpPoints.length+' GCP(s) are still marked "planned," not "surveyed" -- their coordinates are just where you clicked on the map, not a precise measurement. Export anyway?')) return;
   pywebview.api.export_gcps(gcpPoints, buildExportFilename(waypoints)+'_gcps.csv').then(function(res){
     setStatus(res.msg); if(!res.ok && res.msg!=='Cancelled') alert(res.msg);
   });
