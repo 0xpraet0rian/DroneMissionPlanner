@@ -2613,6 +2613,26 @@ function cancelDraw(){
 // across the whole click tolerance the way a vertex does.
 var SNAP_PX_VERTEX = 18;
 var SNAP_PX_EDGE = 9;
+// A vertex only counts as a real, sticky-worthy corner if it's far enough
+// from its immediate neighbors in the source geometry. A hand-drawn survey
+// boundary has a handful of corners tens/hundreds of meters apart -- those
+// deserve the strong pull. A GPS track or CAD-exported road/path can have a
+// vertex every few meters, and without this check every one of those would
+// grab the cursor just as hard as a real corner, making it impossible to
+// smoothly trace or lightly follow the path instead of being yanked through
+// its raw point-by-point digitization. Computed once per imported layer
+// (see computeIsolatedFlags), not per mousemove -- it doesn't depend on zoom.
+var VERTEX_ISOLATION_M = 15;
+function computeIsolatedFlags(coords, closed){
+  var n = coords.length;
+  return coords.map(function(c, i){
+    var prev = closed ? coords[(i - 1 + n) % n] : (i > 0 ? coords[i - 1] : null);
+    var next = closed ? coords[(i + 1) % n] : (i < n - 1 ? coords[i + 1] : null);
+    if(prev && haversine(c[0], c[1], prev[0], prev[1]) < VERTEX_ISOLATION_M) return false;
+    if(next && haversine(c[0], c[1], next[0], next[1]) < VERTEX_ISOLATION_M) return false;
+    return true;
+  });
+}
 function closestPointOnSegment(p, a, b){
   var dx=b.x-a.x, dy=b.y-a.y, lenSq=dx*dx+dy*dy;
   if(lenSq===0) return a;
@@ -2625,8 +2645,14 @@ function findSnapPoint(latlng){
   var clickPt = map.latLngToContainerPoint(latlng);
   var bestVertex=null, bestVertexDist=SNAP_PX_VERTEX;
   importedLayers.forEach(function(layer){
-    var coords = layer.kind==='point' ? [[layer.lat,layer.lon]] : layer.coords;
-    coords.forEach(function(c){
+    if(layer.kind==='point'){
+      var p=map.latLngToContainerPoint([layer.lat,layer.lon]);
+      var d=p.distanceTo(clickPt);
+      if(d<bestVertexDist){ bestVertexDist=d; bestVertex=[layer.lat,layer.lon]; }
+      return;
+    }
+    layer.coords.forEach(function(c, i){
+      if(layer.isolated && layer.isolated[i]===false) return;
       var p=map.latLngToContainerPoint([c[0],c[1]]);
       var d=p.distanceTo(clickPt);
       if(d<bestVertexDist){ bestVertexDist=d; bestVertex=[c[0],c[1]]; }
@@ -3216,8 +3242,8 @@ function importKml(){
     hideProgress();
     if(!res.ok){ if(res.msg!=='Cancelled') alert(res.msg); setStatus(res.msg); return; }
     importedLayers = [];
-    res.polygons.forEach(p=>importedLayers.push({kind:'polygon', name:p.name, coords:p.coords}));
-    res.lines.forEach(l=>importedLayers.push({kind:'line', name:l.name, coords:l.coords}));
+    res.polygons.forEach(p=>importedLayers.push({kind:'polygon', name:p.name, coords:p.coords, isolated:computeIsolatedFlags(p.coords, true)}));
+    res.lines.forEach(l=>importedLayers.push({kind:'line', name:l.name, coords:l.coords, isolated:computeIsolatedFlags(l.coords, false)}));
     res.points.forEach(pt=>importedLayers.push({kind:'point', name:pt.name, lat:pt.lat, lon:pt.lon}));
     drawImportedLayers();
     showTab('layers');
