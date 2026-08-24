@@ -1935,7 +1935,7 @@ details .details-body{padding:2px 10px 10px;}
 
 <div id="toolbar">
   <div class="tgroup">
-    <button class="primary" onclick="importKml()">&#128193; Import KML/KMZ</button>
+    <button id="btn-import" class="primary" onclick="importKml()">&#128193; Import KML/KMZ</button>
   </div>
   <div class="tgroup">
     <button id="btn-finish" onclick="finishDraw()" style="display:none;">&#10003; Finish</button>
@@ -2658,9 +2658,20 @@ function closestPointOnSegment(p, a, b){
   return L.point(a.x+t*dx, a.y+t*dy);
 }
 function findSnapPoint(latlng){
-  if(!importedLayers.length) return null;
+  if(!importedLayers.length && !tempPoints.length) return null;
   var clickPt = map.latLngToContainerPoint(latlng);
   var bestVertex=null, bestVertexDist=SNAP_PX_VERTEX;
+  // Snap to the user's own in-progress drawing too, not just imported
+  // layers -- every point placed so far was a deliberate click, not GPS/
+  // digitizing noise, so all of them get the full sticky treatment. The
+  // main payoff: hovering back near your own first point pulls onto it
+  // exactly, so closing the loop into an area (see finishDraw) actually
+  // produces first===last instead of two merely-close-looking points.
+  tempPoints.forEach(function(c){
+    var p=map.latLngToContainerPoint([c[0],c[1]]);
+    var d=p.distanceTo(clickPt);
+    if(d<bestVertexDist){ bestVertexDist=d; bestVertex=[c[0],c[1]]; }
+  });
   importedLayers.forEach(function(layer){
     if(layer.kind==='point'){
       var p=map.latLngToContainerPoint([layer.lat,layer.lon]);
@@ -2758,7 +2769,18 @@ function finishDraw(){
     pendingKind='grid'; pendingGeom=tempPoints.slice(); pendingGenerated=false;
   } else if(drawMode==='route'){
     if(tempPoints.length<2){ alert('Add at least 2 points to define a route.'); return; }
-    pendingKind='corridor'; pendingGeom=tempPoints.slice(); pendingGenerated=false;
+    // If the last point landed back on the first (self-snap makes this land
+    // exactly, not just "close enough") this was actually meant as an area
+    // boundary, not a linear route to buffer along -- same distinction
+    // parse_geometries makes for a closed LineString on KML import.
+    var pts = tempPoints.slice();
+    var closedLoop = pts.length>=4 &&
+      haversine(pts[0][0],pts[0][1], pts[pts.length-1][0],pts[pts.length-1][1]) < 2;
+    if(closedLoop){
+      pendingKind='grid'; pendingGeom=pts.slice(0,-1); pendingGenerated=false;
+    } else {
+      pendingKind='corridor'; pendingGeom=pts; pendingGenerated=false;
+    }
   } else if(drawMode==='exclude'){
     if(tempPoints.length<3){ alert('Add at least 3 points to define a no-fly hole.'); return; }
     exclusionZones.push({coords: tempPoints.slice()});
@@ -3263,9 +3285,32 @@ function importKml(){
     res.lines.forEach(l=>importedLayers.push({kind:'line', name:l.name, coords:l.coords, isolated:computeIsolatedFlags(l.coords, false)}));
     res.points.forEach(pt=>importedLayers.push({kind:'point', name:pt.name, lat:pt.lat, lon:pt.lon}));
     drawImportedLayers();
+    updateImportButton();
     showTab('layers');
     setStatus(res.msg);
   });
+}
+function clearImportedLayers(){
+  if(!importedLayers.length) return;
+  if(!confirm('Remove all '+importedLayers.length+' imported layer(s) from the map? You can re-import the file anytime.')) return;
+  importedLayers = [];
+  importedGroup.clearLayers();
+  updateImportButton();
+  renderLayersTab();
+  setStatus('Imported layers cleared.');
+}
+function updateImportButton(){
+  var btn = document.getElementById('btn-import');
+  if(!btn) return;
+  if(importedLayers.length){
+    btn.textContent = '✖ Clear KML/KMZ';
+    btn.setAttribute('onclick', 'clearImportedLayers()');
+    btn.title = 'Remove the '+importedLayers.length+' imported layer(s) currently on the map';
+  } else {
+    btn.innerHTML = '&#128193; Import KML/KMZ';
+    btn.setAttribute('onclick', 'importKml()');
+    btn.title = '';
+  }
 }
 function drawImportedLayers(){
   importedGroup.clearLayers();
