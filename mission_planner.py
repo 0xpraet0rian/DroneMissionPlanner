@@ -2782,15 +2782,22 @@ function finishDraw(){
     pendingKind='grid'; pendingGeom=tempPoints.slice(); pendingGenerated=false;
   } else if(drawMode==='route'){
     if(tempPoints.length<2){ alert('Add at least 2 points to define a route.'); return; }
-    // If the last point landed back on the first (self-snap makes this land
-    // exactly, not just "close enough") this was actually meant as an area
-    // boundary, not a linear route to buffer along -- same distinction
-    // parse_geometries makes for a closed LineString on KML import.
+    // The last point can land back on the first just from snapping near a
+    // KMZ vertex close to where you started, not necessarily because you
+    // meant to close a loop -- so this asks instead of silently deciding.
+    // Auto-reclassifying without asking is exactly the kind of silent
+    // behavior-change this app has otherwise avoided (see GCP/upload-picker
+    // history); a closed LineString on KML import is different -- that's
+    // reading a file someone else's tool already saved as closed, not
+    // guessing live intent -- so that path still auto-classifies.
     var pts = tempPoints.slice();
     var closedLoop = pts.length>=4 &&
       haversine(pts[0][0],pts[0][1], pts[pts.length-1][0],pts[pts.length-1][1]) < 2;
     if(closedLoop){
-      pendingKind='grid'; pendingGeom=pts.slice(0,-1); pendingGenerated=false;
+      var wantsArea = confirm('The last point landed back on the first, closing the loop. Did you mean to draw a closed AREA boundary for a grid survey instead of a corridor route?\n\nOK — treat as a grid area\nCancel — keep it as a corridor route');
+      pts = pts.slice(0, -1); // drop the coincident closing point either way -- kept, it'd be a zero-length final corridor leg
+      if(wantsArea){ pendingKind='grid'; pendingGeom=pts; pendingGenerated=false; }
+      else { pendingKind='corridor'; pendingGeom=pts; pendingGenerated=false; }
     } else {
       pendingKind='corridor'; pendingGeom=pts; pendingGenerated=false;
     }
