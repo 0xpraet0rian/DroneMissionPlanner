@@ -395,6 +395,13 @@ DEFAULT_MISSION_CONFIG = {
     # exactly this purpose, and is comfortably within every DJI camera's
     # continuous-shooting capability even at high resolution/RAW.
     'cameraInterval': 2.0,
+    # 'turnOnly' (default): sparse waypoints, camera fires on its own fixed
+    # interval timer -- see cameraInterval's comment above. 'full': a real
+    # waypoint at every photo, no manual step needed, but real flight testing
+    # confirmed it causes position-hold jitter and can hit the RC2's mission-
+    # count limits on a dense grid. Matches the same choice YMapper and
+    # Waypoint OS both expose (checked their actual output, not just docs).
+    'waypointMode': 'turnOnly',
     'flyToWaylineMode': 'safely', 'finishAction': 'goHome',
     'exitOnRCLost': 'executeLostAction', 'executeRCLostAction': 'goBack',
     'takeOffSecurityHeight': 20, 'globalTransitionalSpeed': 10,
@@ -564,21 +571,40 @@ def generate_grid(polygon_latlon, cfg, exclusions_latlon=None):
     if not rows:
         raise ValueError('No coverage generated — the area may be too small for the current spacing/altitude')
 
-    # Real per-photo waypoints (one navigational stop per shot) is what caused
-    # position-hold jitter and RC2 mission-count instability in real flight
-    # testing -- confirmed as a known failure mode independent of this app
-    # (Litchi forum reports of the RC2's mission UI destabilizing on mapping
-    # missions with many closely-packed points, and DJI Fly's own consumer
-    # waypoint docs only support discrete stop-and-shoot actions, not a
-    # continuous-flight interval trigger). The actual practice real drone-
-    # mapping tools use instead (confirmed independently by HOT's
-    # drone-flightplan, used for production humanitarian mapping): fly each
-    # row as one continuous straight line and let the camera's own fixed-
-    # interval timer (set manually before the flight -- can't be encoded in
-    # the WPML file) fire the shutter throughout. Cruise speed is derived FROM
-    # that fixed interval, not the other way around, so a photo actually lands
-    # every forward_spacing meters. See cameraInterval's comment in
-    # DEFAULT_MISSION_CONFIG.
+    # Two waypoint modes, mirroring what YMapper and Waypoint OS both settled
+    # on (checked their actual output/source rather than guessing): "Full"
+    # puts a real navigational stop at every photo, which is simple and needs
+    # no manual pre-flight step, but real flight testing confirmed it causes
+    # position-hold jitter and RC2 mission-count instability on a dense grid
+    # -- see the "turnOnly" branch's comment for the alternative and why it's
+    # the default. Both are legitimate choices depending on area size and
+    # whether you're willing to do the manual camera-interval step.
+    if cfg.get('waypointMode') == 'full':
+        waypoints = []
+        for row in rows:
+            for x, y in row:
+                lx, ly = x * ci - y * si, x * si + y * ci
+                lat, lon = from_xy(lx, ly, ref_lat, ref_lon)
+                waypoints.append({'lat': lat, 'lon': lon, 'alt': cfg['altitude'], 'speed': cfg['speed'],
+                                   'gimbal': cfg.get('gimbalPitch', -90), 'heading_mode': 'followWayline',
+                                   'photo': True, 'hover': cfg.get('delayAtWaypoint', 0)})
+        return waypoints
+
+    # "Turn only" (default): real per-photo waypoints (one navigational stop
+    # per shot) is what caused position-hold jitter and RC2 mission-count
+    # instability in real flight testing -- confirmed as a known failure mode
+    # independent of this app (Litchi forum reports of the RC2's mission UI
+    # destabilizing on mapping missions with many closely-packed points, and
+    # DJI Fly's own consumer waypoint docs only support discrete stop-and-
+    # shoot actions, not a continuous-flight interval trigger). The actual
+    # practice real drone-mapping tools use instead (confirmed independently
+    # by HOT's drone-flightplan, used for production humanitarian mapping):
+    # fly each row as one continuous straight line and let the camera's own
+    # fixed-interval timer (set manually before the flight -- can't be
+    # encoded in the WPML file) fire the shutter throughout. Cruise speed is
+    # derived FROM that fixed interval, not the other way around, so a photo
+    # actually lands every forward_spacing meters. See cameraInterval's
+    # comment in DEFAULT_MISSION_CONFIG.
     camera_interval = cfg.get('cameraInterval') or 2.0
     row_speed = max(0.5, forward_spacing / camera_interval)
 
@@ -695,6 +721,17 @@ def generate_corridor(line_latlon, cfg, exclusions_latlon=None):
         raise ValueError('A corridor route needs at least 2 points')
     if not any(passes):
         raise ValueError('No coverage generated — the route may be too short, or fully inside a no-fly zone')
+
+    # Same Full/Turn Only choice as generate_grid -- see its comment.
+    if cfg.get('waypointMode') == 'full':
+        waypoints = []
+        for pass_xy in passes:
+            for ox, oy in pass_xy:
+                lat, lon = from_xy(ox, oy, ref_lat, ref_lon)
+                waypoints.append({'lat': lat, 'lon': lon, 'alt': cfg['altitude'], 'speed': cfg['speed'],
+                                   'gimbal': cfg.get('gimbalPitch', -90), 'heading_mode': 'followWayline',
+                                   'photo': True, 'hover': cfg.get('delayAtWaypoint', 0)})
+        return waypoints
 
     # Same reasoning as generate_grid: a real per-photo waypoint every
     # forward_spacing meters is what caused position-hold jitter and RC2
@@ -2087,31 +2124,43 @@ function refreshEstimate(){
   else if(pendingKind==='corridor') est=estimateCorridor(pendingGeom, cfg);
   if(!est){ el.innerHTML=''; return; }
   var shutter=recommendedShutterSpeed(cfg);
+  var isFull = cfg.waypointMode==='full';
   var camInterval = cfg.cameraInterval||2.0;
   var rowSpeed = Math.max(0.5, Number(est.forward)/camInterval);
-  var interval=camInterval;
-  // Real waypoints are sparse (row endpoints only, continuous cruise within
-  // each row at rowSpeed, derived from the camera's own fixed interval timer)
-  // instead of one stop per photo -- see generate_grid's Python comment for
-  // why. Model total covered distance as continuous cruise at rowSpeed, plus
-  // one brief accel/decel row-turn per pass (side-spacing hop, always a real
-  // stop since that's an actual direction reversal).
-  var totalDist = Math.max(0, est.photos-1) * Number(est.forward);
-  var turns = Math.max(0, (est.passes||1) - 1);
-  var turnSec = turns * legTimeSec(Number(est.side)||Number(est.forward), rowSpeed, cfg.droneAccel, true);
-  var flightSec = totalDist/rowSpeed + turnSec;
+  var interval = isFull ? (cfg.speed ? (Number(est.forward)/cfg.speed) : 0) : camInterval;
+  var flightSec, estWpCount;
+  if(isFull){
+    // Full mode: a real stop at every photo, same physics as computeFlightSeconds
+    // uses post-generation -- see leg_time_sec's Python comment.
+    var legCount = Math.max(0, est.photos-1);
+    var mustStop = isStopTurn(cfg.turnMode);
+    flightSec = legCount * legTimeSec(Number(est.forward), cfg.speed||1, cfg.droneAccel, mustStop);
+    estWpCount = est.photos;
+  } else {
+    // Turn Only: real waypoints are sparse (row/pass endpoints only,
+    // continuous cruise within each at rowSpeed, derived from the camera's
+    // own fixed interval timer) instead of one stop per photo -- see
+    // generate_grid's Python comment for why. Model total covered distance as
+    // continuous cruise at rowSpeed, plus one brief accel/decel turn per
+    // pass (side-spacing hop, always a real stop since that's an actual
+    // direction reversal).
+    var totalDist = Math.max(0, est.photos-1) * Number(est.forward);
+    var turns = Math.max(0, (est.passes||1) - 1);
+    var turnSec = turns * legTimeSec(Number(est.side)||Number(est.forward), rowSpeed, cfg.droneAccel, true);
+    flightSec = totalDist/rowSpeed + turnSec;
+    // Real waypoint count is sparse (row/pass endpoints only, roughly 2 per
+    // pass) -- see generate_grid's comment. That's what the RC2's per-file
+    // limit actually applies to, not the dense photo count.
+    estWpCount = (est.passes||1)*2;
+  }
   var usableSec = usableBatteryMinutes(cfg)*60;
   var battBatches = Math.max(1, Math.ceil(flightSec/usableSec));
-  // Real waypoint count for grid/corridor is sparse now (row endpoints only,
-  // roughly 2 per pass) -- see generate_grid's comment. That's what the RC2's
-  // per-file limit actually applies to, not the dense photo count.
-  var estWpCount = pendingKind==='grid' ? (est.passes||1)*2 : est.photos;
   var wpBatches = Math.max(1, Math.ceil(estWpCount/(cfg.maxWaypointsPerFile||90)));
   var batches = Math.max(battBatches, wpBatches);
   var warnWhy = wpBatches>battBatches ? '~'+estWpCount+' waypoints is over the safe per-file limit' : '~'+batches+' batteries needed at this size';
   var warn = batches>1
     ? '<div class="hint warn">&#128267; '+warnWhy+' &mdash; use "Export by Battery" after generating to split automatically, or lower overlap/raise altitude to shrink it.</div>' : '';
-  var camNote = pendingKind==='grid' ?
+  var camNote = (!isFull && (pendingKind==='grid' || pendingKind==='corridor')) ?
     '<div class="hint" style="color:var(--orange2);">&#128247; Before flying: set the camera to Timer/interval shooting at <b>'+camInterval.toFixed(1)+'s</b>, then fly this mission at <b>~'+rowSpeed.toFixed(1)+' m/s</b> &mdash; that combination is what actually gets you '+est.forward+'m photo spacing (see the &#63; on Camera interval under Advanced for why this can\'t be automated).</div>' : '';
   var extraStats = '<div class="hint">' +
     (areaM2 ? 'Area <b>'+(areaM2>=10000?(areaM2/10000).toFixed(2)+' ha':Math.round(areaM2)+' m&sup2;')+'</b> &middot; ' : '') +
@@ -2230,6 +2279,10 @@ function gimbalOptions(){
     return '<option value="'+k+'"'+(cfg.gimbalPreset===k?' selected':'')+'>'+g.label+' ('+g.pitch+'&deg;)</option>';
   }).join('');
 }
+function setWaypointMode(mode){
+  cfg.waypointMode = mode;
+  refreshEstimate(); renderSetup();
+}
 function setGimbalPreset(k){
   cfg.gimbalPreset=k;
   var g=PRESETS.gimbals[k];
@@ -2333,7 +2386,13 @@ function renderSetup(){
     // ── Per-mission-type settings, collapsed except the currently relevant one ──
     '<div class="panel-section"><h4>Mission-specific settings</h4>' +
     '<details'+op('grid')+' class="'+(currentKind==='grid'?'active-kind':'')+'"><summary>Grid survey'+badge('grid')+'</summary><div class="details-body">' +
-      '<div class="field-row">' +
+      '<div class="field"><label>Waypoint mode'+help('Turn Only (recommended): sparse waypoints at each row\'s start/end only, camera fires on its own interval timer during continuous flight -- avoids the position-hold jitter and RC2 waypoint-count problems a dense mission can hit, but needs the camera manually set to Timer/interval mode before flight (see Camera interval under Advanced). Full: a real stop-and-shoot waypoint at every photo, no manual step needed -- matches how YMapper and Waypoint OS both default, and how a hand-made DJI Fly mission works -- but can cause visible jitter at close spacing (aircraft settling within hover-accuracy tolerance at every stop) and can hit the RC2\'s waypoint-count limit on a larger survey.')+'</label>' +
+        '<div class="field-row" style="gap:6px;">' +
+          '<button style="flex:1;" class="'+(cfg.waypointMode!=='full'?'active':'')+'" onclick="setWaypointMode(\'turnOnly\')">Turn Only</button>' +
+          '<button style="flex:1;" class="'+(cfg.waypointMode==='full'?'active':'')+'" onclick="setWaypointMode(\'full\')">Full</button>' +
+        '</div>' +
+      '</div>' +
+      '<div class="field-row" style="margin-top:8px;">' +
         '<div class="field"><label>Forward overlap %</label><input type="number" value="'+cfg.forwardOverlap+'" onchange="cfg.forwardOverlap=parseFloat(this.value)||0;refreshEstimate()"></div>' +
         '<div class="field"><label>Side overlap %</label><input type="number" value="'+cfg.sideOverlap+'" onchange="cfg.sideOverlap=parseFloat(this.value)||0;refreshEstimate()"></div>' +
       '</div>' +
@@ -2343,7 +2402,9 @@ function renderSetup(){
       '<button style="width:100%;margin-top:2px;" onclick="autoRotate()" title="Align the sweep to the area\'s longest edge, minimizing wasted transit distance">&#8635; Auto-rotate to minimize flight distance</button>' +
       '<div class="field" style="margin-top:6px;"><label>Wind from (&deg;, optional)</label><input id="wind-dir" type="number" min="0" max="359" placeholder="e.g. 270"></div>' +
       '<button style="width:100%;margin-top:2px;" onclick="rotateForWind()" title="Coverage-path research (e.g. Boustrophedon CPP for UAV surveys in wind) finds sweeping parallel to the wind, not across it, covers faster with steadier speed and less battery spent fighting a crosswind every pass. Enter the direction wind is coming FROM above, if you know it.">&#8634; Align to wind</button>' +
-      '<div class="field" style="margin-top:8px;"><label>Turn style'+help('Waypoints are now only at each row\'s start/end (see Camera interval under Advanced), so this only affects that row-to-row turn, not individual photos -- stopping to reverse direction between rows is standard photogrammetry practice and won\'t cause the position-hold jitter a stop would mid-row. Smooth flythrough banks through the turn instead of stopping, saving a little time but overshooting the row start slightly.')+'</label><select onchange="cfg.turnMode=this.value">' +
+      '<div class="field" style="margin-top:8px;"><label>Turn style'+help(cfg.waypointMode==='full'
+        ? 'In Full mode every waypoint is a photo stop, so this turn mode applies to all of them -- "Stop at each point" keeps camera position/GSD consistent (the standard choice for mapping) but can cause visible position-hold jitter at close spacing, since the aircraft actively settles within its own hover-accuracy tolerance at every single stop. Switch to Turn Only mode instead of just changing this if that jitter is the problem -- it removes the per-photo stops entirely rather than just softening them.'
+        : 'In Turn Only mode, waypoints are only at each row\'s start/end, so this only affects that row-to-row turn, not individual photos -- stopping to reverse direction between rows is standard photogrammetry practice and won\'t cause the position-hold jitter a mid-row stop would. Smooth flythrough banks through the turn instead of stopping, saving a little time but overshooting the row start slightly.')+'</label><select onchange="cfg.turnMode=this.value">' +
         opt('toPointAndStopWithDiscontinuityCurvature',cfg.turnMode,'Stop at each point (precise — recommended for mapping)')+
         opt('toPointAndStopWithContinuityCurvature',cfg.turnMode,'Slow smooth turn, still stops')+
         opt('toPointAndPassWithContinuityCurvature',cfg.turnMode,'Smooth flythrough, never stops')+
@@ -2367,7 +2428,13 @@ function renderSetup(){
     '</div></details>' +
 
     '<details'+op('corridor')+' class="'+(currentKind==='corridor'?'active-kind':'')+'"><summary>Corridor'+badge('corridor')+'</summary><div class="details-body">' +
-      '<div class="field-row">' +
+      '<div class="field"><label>Waypoint mode'+help('Turn Only (recommended): sparse waypoints at each pass\'s start/end only, camera fires on its own interval timer -- avoids position-hold jitter and RC2 waypoint-count problems, but needs the camera manually set to Timer/interval mode before flight (see Camera interval under Advanced). Full: a real stop-and-shoot waypoint at every photo, no manual step needed, but can cause visible jitter at close spacing and hit the RC2\'s waypoint-count limit on a long route.')+'</label>' +
+        '<div class="field-row" style="gap:6px;">' +
+          '<button style="flex:1;" class="'+(cfg.waypointMode!=='full'?'active':'')+'" onclick="setWaypointMode(\'turnOnly\')">Turn Only</button>' +
+          '<button style="flex:1;" class="'+(cfg.waypointMode==='full'?'active':'')+'" onclick="setWaypointMode(\'full\')">Full</button>' +
+        '</div>' +
+      '</div>' +
+      '<div class="field-row" style="margin-top:8px;">' +
         '<div class="field"><label>Forward overlap %</label><input type="number" value="'+cfg.forwardOverlap+'" onchange="cfg.forwardOverlap=parseFloat(this.value)||0;refreshEstimate()"></div>' +
         '<div class="field"><label>Side overlap %</label><input type="number" value="'+cfg.sideOverlap+'" onchange="cfg.sideOverlap=parseFloat(this.value)||0;refreshEstimate()"></div>' +
       '</div>' +
@@ -2538,7 +2605,14 @@ function cancelDraw(){
 }
 
 // ── Snap-to-import: pull drawn points onto imported KML/KMZ vertices/edges ──
-var SNAP_PX = 14;
+// Two different snap radii on purpose: a corner/vertex is a real, exact point
+// someone will want to land on precisely, so it gets a bigger "sticky" catch
+// radius. A point along the middle of a line is an inferred, approximate
+// position, so it only gets a smaller "soft" radius -- easy to land on if
+// you're aiming for it, but it won't reach out and grab the cursor from
+// across the whole click tolerance the way a vertex does.
+var SNAP_PX_VERTEX = 18;
+var SNAP_PX_EDGE = 9;
 function closestPointOnSegment(p, a, b){
   var dx=b.x-a.x, dy=b.y-a.y, lenSq=dx*dx+dy*dy;
   if(lenSq===0) return a;
@@ -2549,47 +2623,64 @@ function closestPointOnSegment(p, a, b){
 function findSnapPoint(latlng){
   if(!importedLayers.length) return null;
   var clickPt = map.latLngToContainerPoint(latlng);
-  var best=null, bestDist=SNAP_PX;
+  var bestVertex=null, bestVertexDist=SNAP_PX_VERTEX;
   importedLayers.forEach(function(layer){
     var coords = layer.kind==='point' ? [[layer.lat,layer.lon]] : layer.coords;
     coords.forEach(function(c){
       var p=map.latLngToContainerPoint([c[0],c[1]]);
       var d=p.distanceTo(clickPt);
-      if(d<bestDist){ bestDist=d; best=[c[0],c[1]]; }
+      if(d<bestVertexDist){ bestVertexDist=d; bestVertex=[c[0],c[1]]; }
     });
-    if(layer.kind!=='point' && coords.length>1){
-      var edgeCount = layer.kind==='polygon' ? coords.length : coords.length-1;
-      for(var i=0;i<edgeCount;i++){
-        var a=coords[i], b=coords[(i+1)%coords.length];
-        var pa=map.latLngToContainerPoint([a[0],a[1]]);
-        var pb=map.latLngToContainerPoint([b[0],b[1]]);
-        var proj=closestPointOnSegment(clickPt, pa, pb);
-        var d=proj.distanceTo(clickPt);
-        if(d<bestDist){
-          bestDist=d;
-          var ll=map.containerPointToLatLng(proj);
-          best=[ll.lat,ll.lng];
-        }
+  });
+  if(bestVertex) return {point:bestVertex, onVertex:true};
+  // No vertex close enough -- try a softer, smaller-radius snap onto the
+  // nearest point along an edge instead.
+  var bestEdge=null, bestEdgeDist=SNAP_PX_EDGE;
+  importedLayers.forEach(function(layer){
+    if(layer.kind==='point') return;
+    var coords = layer.coords;
+    if(coords.length<2) return;
+    var edgeCount = layer.kind==='polygon' ? coords.length : coords.length-1;
+    for(var i=0;i<edgeCount;i++){
+      var a=coords[i], b=coords[(i+1)%coords.length];
+      var pa=map.latLngToContainerPoint([a[0],a[1]]);
+      var pb=map.latLngToContainerPoint([b[0],b[1]]);
+      var proj=closestPointOnSegment(clickPt, pa, pb);
+      var d=proj.distanceTo(clickPt);
+      if(d<bestEdgeDist){
+        bestEdgeDist=d;
+        var ll=map.containerPointToLatLng(proj);
+        bestEdge=[ll.lat,ll.lng];
       }
     }
   });
-  return best;
+  return bestEdge ? {point:bestEdge, onVertex:false} : null;
 }
-function showSnapIndicator(latlng){
+function showSnapIndicator(latlng, onVertex){
   snapGroup.clearLayers();
-  if(latlng) L.circleMarker(latlng,{radius:9,color:'#ff9500',weight:2,fillColor:'#ff9500',fillOpacity:.25}).addTo(snapGroup);
+  if(!latlng) return;
+  if(onVertex) L.circleMarker(latlng,{radius:9,color:'#ff9500',weight:2,fillColor:'#ff9500',fillOpacity:.35}).addTo(snapGroup);
+  else L.circleMarker(latlng,{radius:6,color:'#ff9500',weight:1.5,fillColor:'#ff9500',fillOpacity:.15,dashArray:'2,2'}).addTo(snapGroup);
 }
 
 map.on('mousemove', function(e){
-  if(!drawMode){ if(snapGroup.getLayers().length) snapGroup.clearLayers(); return; }
+  if(!drawMode){
+    if(snapGroup.getLayers().length) snapGroup.clearLayers();
+    map.getContainer().style.cursor='';
+    return;
+  }
   var snap=findSnapPoint(e.latlng);
-  showSnapIndicator(snap ? L.latLng(snap[0],snap[1]) : null);
+  showSnapIndicator(snap ? L.latLng(snap.point[0],snap.point[1]) : null, snap && snap.onVertex);
+  // A "+" cursor specifically for the soft line-snap case -- a cue that
+  // clicking here inserts a point onto the line, distinct from the strong
+  // pull of a vertex (which already has its own larger, filled indicator).
+  map.getContainer().style.cursor = (snap && !snap.onVertex) ? 'crosshair' : '';
 });
 
 map.on('click', function(e){
   if(!drawMode) return;
   var snap=findSnapPoint(e.latlng);
-  var lat=snap?snap[0]:e.latlng.lat, lon=snap?snap[1]:e.latlng.lng;
+  var lat=snap?snap.point[0]:e.latlng.lat, lon=snap?snap.point[1]:e.latlng.lng;
   if(drawMode==='area' || drawMode==='route' || drawMode==='exclude'){
     tempPoints.push([lat,lon]);
     redrawTemp();
@@ -2876,7 +2967,7 @@ function renderWaypointsTab(){
     '</tr>';
   }).join('');
   var camReminder = '';
-  if(pendingKind==='grid' || pendingKind==='corridor'){
+  if((pendingKind==='grid' || pendingKind==='corridor') && cfg.waypointMode!=='full'){
     var ci = cfg.cameraInterval||2.0;
     var rowSpd = waypoints.find(w=>!w.photo && w.speed) ? waypoints[0].speed : null;
     camReminder = '<div class="hint warn" style="margin-bottom:8px;padding:8px 10px;border:1px solid var(--orange-dim);border-radius:var(--radius-sm);background:#1c1300;">' +
@@ -2914,12 +3005,14 @@ function deleteWaypoint(i){
 function updateStats(){
   var dist=0;
   for(var i=1;i<waypoints.length;i++){ dist += haversine(waypoints[i-1].lat,waypoints[i-1].lon,waypoints[i].lat,waypoints[i].lon); }
-  // Grid/corridor waypoints carry photo:false now (the camera's own interval
-  // timer takes the shots, not a per-waypoint action -- see generate_grid's
-  // Python comment), so their dense estimate is added back in here; any
-  // photo:true points still present (an appended overview lap, or an orbit/
-  // manual mission, which are unaffected by this) count normally.
-  var isDenseKind = pendingKind==='grid' || pendingKind==='corridor';
+  // Turn Only grid/corridor waypoints carry photo:false (the camera's own
+  // interval timer takes the shots, not a per-waypoint action -- see
+  // generate_grid's Python comment), so their dense estimate is added back in
+  // here; Full mode already has a real photo:true on every shot, so adding
+  // the dense estimate on top would double-count. Any photo:true points from
+  // an appended overview lap, or an orbit/manual mission, count normally
+  // either way.
+  var isDenseKind = (pendingKind==='grid' || pendingKind==='corridor') && cfg.waypointMode!=='full';
   var photoCount = (isDenseKind ? lastEstimatedPhotos : 0) + waypoints.filter(w=>w.photo).length;
   var flightSec = computeFlightSeconds(waypoints, cfg);
   var mins = Math.floor(flightSec/60), secs = Math.round(flightSec%60);
@@ -3193,11 +3286,13 @@ function timestampTag(){
 function buildExportFilename(wps){
   var flightSec = computeFlightSeconds(wps, cfg);
   var mins=Math.floor(flightSec/60), secs=Math.round(flightSec%60);
-  // Exact for a whole-mission export; a battery/waypoint-count-split batch
-  // falls back to counting photo:true (undercounts for a grid/corridor batch,
-  // since those carry photo:false now -- see updateStats' comment) rather
-  // than trying to apportion the dense estimate per batch.
-  var isDenseKind = (pendingKind==='grid' || pendingKind==='corridor') && wps===waypoints;
+  // Exact for a whole-mission export in Turn Only mode; a battery/waypoint-
+  // count-split batch falls back to counting photo:true (undercounts for a
+  // Turn Only grid/corridor batch, since those carry photo:false -- see
+  // updateStats' comment) rather than trying to apportion the dense estimate
+  // per batch. Full mode always just counts photo:true, no dense estimate
+  // involved.
+  var isDenseKind = (pendingKind==='grid' || pendingKind==='corridor') && cfg.waypointMode!=='full' && wps===waypoints;
   var photoCount = (isDenseKind ? lastEstimatedPhotos : 0) + wps.filter(w=>w.photo).length;
   return sanitizeMissionName(missionName)+'_'+timestampTag()+'_'+mins+'m'+secs+'s_'+photoCount+'p_'+droneSlug();
 }

@@ -66,6 +66,17 @@ cannot do for you — skip it and the mission still flies, it just won't take an
 photos.** No-fly zones still work correctly with this: a zone cutting through a row
 splits it into separate flyable segments instead of drawing a straight line through it.
 
+That's the default ("Turn Only"), but it's a real tradeoff and not everyone wants to make
+it every time, so both grid and corridor missions have a **Waypoint mode** toggle right in
+their settings: **Turn Only** (above) or **Full** — a real stop-and-shoot waypoint at
+every photo, no manual camera step needed, matching how a hand-made DJI Fly mission or a
+small area survey behaves. Full mode is a legitimate choice for a small site where
+waypoint count was never going to be a problem, or when you'd rather not touch the
+camera's settings before flight — you're trading that convenience for the position-hold
+jitter and RC2 waypoint-count risk Turn Only exists to avoid. Checked what other real
+tools do here before building this: [YMapper](https://github.com/YarosMallorca/DJI-Mapper)
+and Waypoint OS both expose the exact same choice, for the same reason.
+
 Orbit and Manual missions are unaffected — their waypoints were always meant to be
 individual shots, not a continuous strip, so they keep ordinary per-waypoint photo
 actions.
