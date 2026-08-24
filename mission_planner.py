@@ -459,7 +459,34 @@ def _point_in_polygon(x, y, poly):
 def _in_any_polygon(x, y, polys):
     return any(_point_in_polygon(x, y, p) for p in polys) if polys else False
 
-def _sweep_coverage_rows(rpts, side_spacing, forward_spacing, exclude_polys=None):
+def _dist_point_to_segment(px, py, ax, ay, bx, by):
+    dx, dy = bx - ax, by - ay
+    if dx == 0 and dy == 0:
+        return math.hypot(px - ax, py - ay)
+    t = max(0.0, min(1.0, ((px - ax) * dx + (py - ay) * dy) / (dx * dx + dy * dy)))
+    return math.hypot(px - (ax + t * dx), py - (ay + t * dy))
+
+def _dist_point_to_polygon_boundary(x, y, poly):
+    n = len(poly)
+    return min(_dist_point_to_segment(x, y, poly[i][0], poly[i][1], poly[(i + 1) % n][0], poly[(i + 1) % n][1])
+               for i in range(n))
+
+def _near_polygon(x, y, poly, margin):
+    """Inside the polygon, OR just outside but within `margin` of its boundary.
+    A boundary is where the surveyed site ends, not a fence the sweep must
+    stay strictly inside of -- a sample just past the edge still has a real
+    photo footprint covering the boundary, and the DJI Mini 5 Pro's own real
+    footprint overlap makes a little overshoot free extra coverage, not a
+    flaw. Without this, rows near a polygon's corners (worse the more the
+    sweep angle is skewed from the shape) get clipped short for no operational
+    reason, which is what produced the ragged/short-row pattern -- confirmed
+    by direct test: a sweep whose rotation exactly matches the polygon's true
+    orientation still tapers at the tips without this margin."""
+    if margin <= 0:
+        return _point_in_polygon(x, y, poly)
+    return _point_in_polygon(x, y, poly) or _dist_point_to_polygon_boundary(x, y, poly) <= margin
+
+def _sweep_coverage_rows(rpts, side_spacing, forward_spacing, exclude_polys=None, boundary_margin=0.0):
     """Boustrophedon (lawnmower) sweep across the polygon's bounding box, keeping
     only in-polygon sample points and snapping each row's last point out to the
     true edge so rows don't stop short. Returns a list of ROWS (each a list of
@@ -477,8 +504,8 @@ def _sweep_coverage_rows(rpts, side_spacing, forward_spacing, exclude_polys=None
     straight line between two points would cut through a no-fly zone."""
     xs = [p[0] for p in rpts]
     ys = [p[1] for p in rpts]
-    minx, maxx = min(xs), max(xs)
-    miny, maxy = min(ys), max(ys)
+    minx, maxx = min(xs) - boundary_margin, max(xs) + boundary_margin
+    miny, maxy = min(ys) - boundary_margin, max(ys) + boundary_margin
     rows = []
     reverse = False
     y = miny
@@ -486,10 +513,10 @@ def _sweep_coverage_rows(rpts, side_spacing, forward_spacing, exclude_polys=None
         line = []
         x = minx
         while x <= maxx + 1e-9:
-            if _point_in_polygon(x, y, rpts) and not _in_any_polygon(x, y, exclude_polys):
+            if _near_polygon(x, y, rpts, boundary_margin) and not _in_any_polygon(x, y, exclude_polys):
                 line.append((x, y))
             x += forward_spacing
-        if (line and abs(maxx - line[-1][0]) > 1e-6 and _point_in_polygon(maxx, y, rpts)
+        if (line and abs(maxx - line[-1][0]) > 1e-6 and _near_polygon(maxx, y, rpts, boundary_margin)
                 and not _in_any_polygon(maxx, y, exclude_polys)):
             line.append((maxx, y))
         if reverse:
@@ -500,12 +527,12 @@ def _sweep_coverage_rows(rpts, side_spacing, forward_spacing, exclude_polys=None
         y += side_spacing
     return rows
 
-def _sweep_coverage(rpts, side_spacing, forward_spacing, exclude_polys=None):
+def _sweep_coverage(rpts, side_spacing, forward_spacing, exclude_polys=None, boundary_margin=0.0):
     """Flat dense sample list -- the real per-photo positions, used for photo-
     count/area/interval estimates (and by the JS live-estimate mirror). The
     actual flight path generate_grid builds does NOT fly to each of these; see
     _sweep_coverage_rows."""
-    rows = _sweep_coverage_rows(rpts, side_spacing, forward_spacing, exclude_polys)
+    rows = _sweep_coverage_rows(rpts, side_spacing, forward_spacing, exclude_polys, boundary_margin)
     return [pt for row in rows for pt in row]
 
 def _split_row_gaps(row, forward_spacing):
@@ -553,11 +580,12 @@ def grid_photo_points(polygon_latlon, cfg, exclusions_latlon=None):
     cf, sf = math.cos(-rot), math.sin(-rot)
     rpts = [(x * cf - y * sf, x * sf + y * cf) for x, y in pts_xy]
     exclude_rpolys = _project_exclusions(exclusions_latlon, ref_lat, ref_lon, cf, sf)
-    pts = _sweep_coverage(rpts, side_spacing, forward_spacing, exclude_rpolys)
+    margin = side_spacing / 2.0
+    pts = _sweep_coverage(rpts, side_spacing, forward_spacing, exclude_rpolys, margin)
     if cfg.get('crosshatch'):
         transposed = [(y, x) for x, y in rpts]
         transposed_excl = [[(y, x) for x, y in poly] for poly in exclude_rpolys]
-        pts += _sweep_coverage(transposed, side_spacing, forward_spacing, transposed_excl)
+        pts += _sweep_coverage(transposed, side_spacing, forward_spacing, transposed_excl, margin)
     return pts
 
 def generate_grid(polygon_latlon, cfg, exclusions_latlon=None):
@@ -575,14 +603,23 @@ def generate_grid(polygon_latlon, cfg, exclusions_latlon=None):
     rpts = [(x * cf - y * sf, x * sf + y * cf) for x, y in pts_xy]
     exclude_rpolys = _project_exclusions(exclusions_latlon, ref_lat, ref_lon, cf, sf)
 
-    rows = _sweep_coverage_rows(rpts, side_spacing, forward_spacing, exclude_rpolys)
+    # Sample points just past the true boundary still count as covered, up to
+    # half a row's spacing out. The boundary is where the surveyed site ends,
+    # not a fence the flight path must stay strictly inside of -- a photo
+    # taken a little past the edge is free extra coverage, not a defect, and
+    # treating the edge as hard-strict is exactly what produced short/ragged
+    # rows near a polygon's corners (confirmed by direct test against a true
+    # rectangle: even a sweep rotation that exactly matches the shape's own
+    # tilt still tapers at the tips without this margin).
+    margin = side_spacing / 2.0
+    rows = _sweep_coverage_rows(rpts, side_spacing, forward_spacing, exclude_rpolys, margin)
     if cfg.get('crosshatch'):
         # A second sweep at 90° catches gaps the first sweep's direction misses,
         # especially on concave/irregular site boundaries — appended as a second
         # pass rather than interleaved, so it always runs after the main grid.
         transposed = [(y, x) for x, y in rpts]
         transposed_excl = [[(y, x) for x, y in poly] for poly in exclude_rpolys]
-        rows2 = _sweep_coverage_rows(transposed, side_spacing, forward_spacing, transposed_excl)
+        rows2 = _sweep_coverage_rows(transposed, side_spacing, forward_spacing, transposed_excl, margin)
         rows += [[(x, y) for y, x in row] for row in rows2]
 
     if not rows:
@@ -2076,22 +2113,45 @@ function pointInAnyPolygonJS(x,y,polys){
   for(var i=0;i<polys.length;i++){ if(pointInPolygonJS(x,y,polys[i])) return true; }
   return false;
 }
+function distPointToSegmentJS(px,py,ax,ay,bx,by){
+  var dx=bx-ax, dy=by-ay;
+  if(dx===0 && dy===0) return Math.hypot(px-ax, py-ay);
+  var t=Math.max(0,Math.min(1, ((px-ax)*dx+(py-ay)*dy)/(dx*dx+dy*dy)));
+  return Math.hypot(px-(ax+t*dx), py-(ay+t*dy));
+}
+function distPointToPolygonBoundaryJS(x,y,poly){
+  var n=poly.length, best=Infinity;
+  for(var i=0;i<n;i++){
+    var j=(i+1)%n;
+    var d=distPointToSegmentJS(x,y,poly[i][0],poly[i][1],poly[j][0],poly[j][1]);
+    if(d<best) best=d;
+  }
+  return best;
+}
+// Mirrors _near_polygon in the Python backend: a sample just past the true
+// boundary still counts as covered, up to `margin` out -- see that function's
+// comment for why this isn't a bug to "fix" back to strict containment.
+function nearPolygonJS(x,y,poly,margin){
+  if(!margin || margin<=0) return pointInPolygonJS(x,y,poly);
+  return pointInPolygonJS(x,y,poly) || distPointToPolygonBoundaryJS(x,y,poly)<=margin;
+}
 function projectExclusionsJS(exclusions, refLat, refLon, cf, sf){
   return (exclusions||[]).filter(e=>e.length>=3).map(function(e){
     return e.map(p=>toXY(p[0],p[1],refLat,refLon)).map(p=>[p[0]*cf-p[1]*sf, p[0]*sf+p[1]*cf]);
   });
 }
-function sweepCoverageJS(rpts, sideSpacing, forwardSpacing, excludePolys){
+function sweepCoverageJS(rpts, sideSpacing, forwardSpacing, excludePolys, boundaryMargin){
+  var margin=boundaryMargin||0;
   var xs=rpts.map(p=>p[0]), ys=rpts.map(p=>p[1]);
-  var minx=Math.min.apply(null,xs), maxx=Math.max.apply(null,xs);
-  var miny=Math.min.apply(null,ys), maxy=Math.max.apply(null,ys);
+  var minx=Math.min.apply(null,xs)-margin, maxx=Math.max.apply(null,xs)+margin;
+  var miny=Math.min.apply(null,ys)-margin, maxy=Math.max.apply(null,ys)+margin;
   var pts=[], reverse=false, count=0, maxIter=200000;
   for(var y=miny; y<=maxy+1e-9 && count<maxIter; y+=sideSpacing){
     var line=[];
     for(var x=minx; x<=maxx+1e-9 && count<maxIter; x+=forwardSpacing, count++){
-      if(pointInPolygonJS(x,y,rpts) && !pointInAnyPolygonJS(x,y,excludePolys)) line.push([x,y]);
+      if(nearPolygonJS(x,y,rpts,margin) && !pointInAnyPolygonJS(x,y,excludePolys)) line.push([x,y]);
     }
-    if(line.length && Math.abs(maxx-line[line.length-1][0])>1e-6 && pointInPolygonJS(maxx,y,rpts) && !pointInAnyPolygonJS(maxx,y,excludePolys)) line.push([maxx,y]);
+    if(line.length && Math.abs(maxx-line[line.length-1][0])>1e-6 && nearPolygonJS(maxx,y,rpts,margin) && !pointInAnyPolygonJS(maxx,y,excludePolys)) line.push([maxx,y]);
     if(reverse) line.reverse();
     pts=pts.concat(line);
     reverse=!reverse;
@@ -2108,18 +2168,19 @@ function estimateGrid(polygon, c, exclusions){
   var exPolys=projectExclusionsJS(exclusions, refLat, refLon, cf, sf);
   var sp=coverageSpacing(c);
   var side=sp[0], forward=sp[1];
-  var count=sweepCoverageJS(rpts, side, forward, exPolys).length;
+  var margin=side/2; // mirrors _near_polygon's margin in generate_grid -- keeps this live estimate in sync with the real export
+  var count=sweepCoverageJS(rpts, side, forward, exPolys, margin).length;
   if(c.crosshatch && !c.threeDMapping){
     var transposed=rpts.map(p=>[p[1],p[0]]);
     var exTransposed=exPolys.map(poly=>poly.map(p=>[p[1],p[0]]));
-    count += sweepCoverageJS(transposed, side, forward, exTransposed).length;
+    count += sweepCoverageJS(transposed, side, forward, exTransposed, margin).length;
   }
   if(c.threeDMapping){
     // Mirrors generate_3d_mapping: a second full pass rotated 90°, oblique gimbal.
     var rot2=((c.rotationDeg||0)+90)*Math.PI/180, cf2=Math.cos(-rot2), sf2=Math.sin(-rot2);
     var rpts2=pts.map(p=>[p[0]*cf2-p[1]*sf2, p[0]*sf2+p[1]*cf2]);
     var exPolys2=projectExclusionsJS(exclusions, refLat, refLon, cf2, sf2);
-    count += sweepCoverageJS(rpts2, side, forward, exPolys2).length;
+    count += sweepCoverageJS(rpts2, side, forward, exPolys2, margin).length;
   }
   var xs=rpts.map(p=>p[0]), ys=rpts.map(p=>p[1]);
   var passes=Math.max(1,Math.round((Math.max.apply(null,ys)-Math.min.apply(null,ys))/side)+1);
@@ -2570,16 +2631,17 @@ function usableBatteryMinutes(c){
   var reserve=c.reserveFraction!=null?c.reserveFraction:0.30;
   return Math.max(1, (c.batteryMinutes||20) * realistic * (1-reserve));
 }
-function autoRotate(){
+function autoRotate(silent){
   var poly = (pendingKind==='grid') ? pendingGeom : null;
-  if(!poly){ alert('Draw or select a grid area first, then Auto-rotate.'); return; }
+  if(!poly){ if(!silent) alert('Draw or select a grid area first, then Auto-rotate.'); return; }
   pywebview.api.optimal_rotation(poly).then(function(res){
-    if(!res.ok){ alert('Could not compute rotation: '+res.msg); return; }
+    if(!res.ok){ if(!silent) alert('Could not compute rotation: '+res.msg); return; }
     cfg.rotationDeg = res.rotation;
     var slider=document.getElementById('rot-slider'), val=document.getElementById('rot-val');
     if(slider) slider.value=res.rotation;
     if(val) val.textContent=res.rotation+'°';
     refreshEstimate();
+    if(silent) renderSetup();
   });
 }
 function rotateForWind(){
@@ -2808,6 +2870,10 @@ function finishDraw(){
     refreshEstimate();
   }
   cancelDraw();
+  if(pendingKind==='grid') autoRotate(true); // hand-clicked corners are never a perfect rectangle in screen coords --
+                                              // align the sweep to the polygon's own longest edge by default so rows
+                                              // come out uniform regardless of how the shape is tilted, instead of
+                                              // leaving whatever rotationDeg was left over from a previous mission.
   showTab('setup');
 }
 
@@ -3400,7 +3466,7 @@ function renderLayersTab(){
     return '<div class="layer-item"><div class="name">'+kindLabel+': '+layer.name+'</div><div class="actions">'+actions+'</div></div>';
   }).join('') + '</div>';
 }
-function useLayerAsGrid(i){ pendingKind='grid'; pendingGeom=importedLayers[i].coords.slice(); pendingGenerated=false; showTab('setup'); }
+function useLayerAsGrid(i){ pendingKind='grid'; pendingGeom=importedLayers[i].coords.slice(); pendingGenerated=false; autoRotate(true); showTab('setup'); }
 function useLayerAsCorridor(i){ pendingKind='corridor'; pendingGeom=importedLayers[i].coords.slice(); pendingGenerated=false; showTab('setup'); }
 function useLayerAsOrbit(i){ pendingKind='orbit'; pendingGeom=[importedLayers[i].lat, importedLayers[i].lon]; pendingGenerated=false; showTab('setup'); }
 function useLayerAsWaypoints(i){
