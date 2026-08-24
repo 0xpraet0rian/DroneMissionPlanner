@@ -200,8 +200,25 @@ def parse_geometries(root):
                 for c in geom:
                     if _local(c.tag) == 'coordinates' and c.text:
                         coords = _parse_coord_text(c.text)
-                        if len(coords) >= 2:
-                            lines.append({'name': name or f'Route {len(lines) + 1}', 'coords': coords})
+                        if len(coords) < 2:
+                            continue
+                        # Some tools (CAD/GIS exports especially) save a
+                        # closed area as a LineString that returns to its
+                        # own start point instead of a proper <Polygon> tag.
+                        # Detect that (>=4 points, first and last within a
+                        # couple meters of each other) and treat it as an
+                        # area, not a route -- otherwise it only offers "use
+                        # as corridor," which buffers along it as if flying
+                        # a road, when the shape was actually meant as a
+                        # survey boundary.
+                        closed = (len(coords) >= 4
+                                  and haversine_m(coords[0][0], coords[0][1], coords[-1][0], coords[-1][1]) < 2.0)
+                        if closed:
+                            outer = coords[:-1]
+                            if len(outer) >= 3:
+                                polygons.append({'name': name or f'Area {len(polygons) + 1}', 'coords': outer})
+                                continue
+                        lines.append({'name': name or f'Route {len(lines) + 1}', 'coords': coords})
             elif tagl == 'Point':
                 for c in geom:
                     if _local(c.tag) == 'coordinates' and c.text:
