@@ -982,10 +982,29 @@ def _convex_hull(points):
         upper.append(p)
     return lower[:-1] + upper[:-1]
 
-def optimal_rotation_deg(polygon_latlon):
+def optimal_rotation_deg(polygon_latlon, cfg=None):
     """Rotating calipers: the minimum-area bounding rectangle of a convex hull is
     always aligned with one of its edges, so test each edge angle and keep the
-    smallest. Aligns the grid sweep to minimize wasted transit distance."""
+    smallest. Aligns the grid sweep to minimize wasted transit distance.
+
+    For an actual rectangle (or anything close to one), the edge angle along
+    its LONG side and the edge angle along its SHORT side both produce the
+    exact same bounding-box area (rotating a rectangle 90 degrees doesn't
+    change its area) -- so area alone is a tie between "few long passes" and
+    "many short passes", and which one wins was effectively down to hull
+    vertex order, not efficiency. That's the bug: it could just as easily
+    align the sweep across the short axis, producing many more passes (and
+    turns) than flying along the long axis for the identical bounding area.
+
+    Once cfg is known this instead scores each candidate by estimated total
+    FLIGHT TIME (not raw distance -- a short row and a short inter-row
+    side-step both pay the same accel/decel/stop-and-rotate cost as a long
+    one, via the same leg_time_sec model used for the real time estimate),
+    and picks the genuinely faster orientation. Raw distance alone still
+    under-penalizes lots of short passes (more distance can lose to fewer
+    turns once turn overhead is counted), which is why this isn't just
+    summing row lengths. Without cfg (e.g. an older caller), falls back to
+    the plain min-area angle, tie-broken toward fewer passes."""
     if len(polygon_latlon) < 3:
         return 0.0
     ref_lat = sum(p[0] for p in polygon_latlon) / len(polygon_latlon)
@@ -995,7 +1014,7 @@ def optimal_rotation_deg(polygon_latlon):
     if len(hull) < 3:
         return 0.0
 
-    best_angle, best_area = 0.0, float('inf')
+    candidates = []  # (edge_angle, rx_span, ry_span, area)
     n = len(hull)
     for i in range(n):
         x1, y1 = hull[i]
@@ -1004,12 +1023,30 @@ def optimal_rotation_deg(polygon_latlon):
         c, s = math.cos(-edge_angle), math.sin(-edge_angle)
         rx = [x * c - y * s for x, y in hull]
         ry = [x * s + y * c for x, y in hull]
-        area = (max(rx) - min(rx)) * (max(ry) - min(ry))
-        if area < best_area:
-            best_area = area
-            best_angle = edge_angle
+        rx_span, ry_span = max(rx) - min(rx), max(ry) - min(ry)
+        candidates.append((edge_angle, rx_span, ry_span, rx_span * ry_span))
 
-    return round(math.degrees(best_angle) % 180, 1)
+    best_area = min(c[3] for c in candidates)
+
+    side_spacing = coverage_spacing(cfg)[0] if cfg else None
+    if side_spacing and side_spacing > 0:
+        speed = cfg.get('speed') or 8
+        accel = cfg.get('droneAccel') or 1.4
+        def time_estimate(c):
+            _, rx_span, ry_span, _ = c
+            passes = max(1, math.ceil(ry_span / side_spacing) + 1)
+            row_time = leg_time_sec(rx_span, speed, accel, True)
+            turn_time = leg_time_sec(side_spacing, speed, accel, True)
+            return passes * row_time + max(0, passes - 1) * turn_time
+        best = min(candidates, key=time_estimate)
+    else:
+        # No cfg given -- still break area ties toward the orientation with
+        # fewer rows (larger rx_span = passes run along the long axis)
+        # instead of picking whichever edge the hull happened to start on.
+        near_min = [c for c in candidates if c[3] <= best_area * 1.001]
+        best = max(near_min, key=lambda c: c[1])
+
+    return round(math.degrees(best[0]) % 180, 1)
 
 # ── DJI WPML export (wpmz/template.kml + wpmz/waylines.wpml inside a .kmz) ──────
 # XML structure and field names verified against DJI's published WPML spec and
@@ -1535,9 +1572,9 @@ class Api:
         except Exception as e:
             return {'ok': False, 'msg': f'Elevation lookup failed (needs internet access): {e}'}
 
-    def optimal_rotation(self, polygon):
+    def optimal_rotation(self, polygon, cfg=None):
         try:
-            return {'ok': True, 'rotation': optimal_rotation_deg(polygon)}
+            return {'ok': True, 'rotation': optimal_rotation_deg(polygon, cfg)}
         except Exception as e:
             return {'ok': False, 'msg': str(e)}
 
@@ -2634,7 +2671,7 @@ function usableBatteryMinutes(c){
 function autoRotate(silent){
   var poly = (pendingKind==='grid') ? pendingGeom : null;
   if(!poly){ if(!silent) alert('Draw or select a grid area first, then Auto-rotate.'); return; }
-  pywebview.api.optimal_rotation(poly).then(function(res){
+  pywebview.api.optimal_rotation(poly, cfg).then(function(res){
     if(!res.ok){ if(!silent) alert('Could not compute rotation: '+res.msg); return; }
     cfg.rotationDeg = res.rotation;
     var slider=document.getElementById('rot-slider'), val=document.getElementById('rot-val');
