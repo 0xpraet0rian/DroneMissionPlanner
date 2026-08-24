@@ -506,10 +506,21 @@ def _sweep_coverage_rows(rpts, side_spacing, forward_spacing, exclude_polys=None
     ys = [p[1] for p in rpts]
     minx, maxx = min(xs) - boundary_margin, max(xs) + boundary_margin
     miny, maxy = min(ys) - boundary_margin, max(ys) + boundary_margin
+    # Stepping rows by a fixed side_spacing from miny can leave up to a whole
+    # side_spacing uncovered at the far (maxy) edge once the span doesn't
+    # divide evenly -- the near edge always lands flush on miny, so any
+    # leftover all piles up on one side, which is what reads as coverage
+    # being "off-center"/lopsided rather than evenly filling the shape.
+    # Distributing the same row count evenly across the full span (never
+    # wider than the requested side_spacing, only tighter) reaches both
+    # edges symmetrically instead.
+    span_y = maxy - miny
+    n_rows = max(1, math.ceil(span_y / side_spacing) + 1) if span_y > 0 else 1
+    row_spacing = span_y / (n_rows - 1) if n_rows > 1 else side_spacing
     rows = []
     reverse = False
-    y = miny
-    while y <= maxy + 1e-9:
+    for row_i in range(n_rows):
+        y = miny + row_i * row_spacing
         line = []
         x = minx
         while x <= maxx + 1e-9:
@@ -524,7 +535,6 @@ def _sweep_coverage_rows(rpts, side_spacing, forward_spacing, exclude_polys=None
         if line:
             rows.append(line)
         reverse = not reverse
-        y += side_spacing
     return rows
 
 def _sweep_coverage(rpts, side_spacing, forward_spacing, exclude_polys=None, boundary_margin=0.0):
@@ -2182,8 +2192,16 @@ function sweepCoverageJS(rpts, sideSpacing, forwardSpacing, excludePolys, bounda
   var xs=rpts.map(p=>p[0]), ys=rpts.map(p=>p[1]);
   var minx=Math.min.apply(null,xs)-margin, maxx=Math.max.apply(null,xs)+margin;
   var miny=Math.min.apply(null,ys)-margin, maxy=Math.max.apply(null,ys)+margin;
+  // Distribute rows evenly across the full span (mirrors _sweep_coverage_rows
+  // in the Python backend) instead of stepping a fixed sideSpacing from miny,
+  // which can leave a whole sideSpacing uncovered at the far edge and reads
+  // as lopsided/off-center coverage.
+  var spanY=maxy-miny;
+  var nRows=spanY>0 ? Math.max(1, Math.ceil(spanY/sideSpacing)+1) : 1;
+  var rowSpacing=nRows>1 ? spanY/(nRows-1) : sideSpacing;
   var pts=[], reverse=false, count=0, maxIter=200000;
-  for(var y=miny; y<=maxy+1e-9 && count<maxIter; y+=sideSpacing){
+  for(var rowI=0; rowI<nRows && count<maxIter; rowI++){
+    var y=miny+rowI*rowSpacing;
     var line=[];
     for(var x=minx; x<=maxx+1e-9 && count<maxIter; x+=forwardSpacing, count++){
       if(nearPolygonJS(x,y,rpts,margin) && !pointInAnyPolygonJS(x,y,excludePolys)) line.push([x,y]);
