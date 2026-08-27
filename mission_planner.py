@@ -23,6 +23,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 import os, sys, math, json, time, zipfile, threading, re, tempfile, shutil, base64
 import urllib.request, urllib.parse
+import http.server
 import xml.etree.ElementTree as ET
 import webview
 
@@ -3852,12 +3853,36 @@ function hideProgress(){ document.getElementById('progress-overlay').classList.r
 </html>"""
 
 # ── Entry point ────────────────────────────────────────────────────────────────
+# Served from a local loopback HTTP server rather than passed as html= directly.
+# pywebview's html= loads the page via NavigateToString, which WebView2 gives a
+# null/opaque origin -- browsers only allow the Geolocation API (and other
+# secure-context-gated features) on https or on localhost/127.0.0.1, so the
+# geolocate button would fail with "Only secure origins are allowed" on every
+# launch under html=. 127.0.0.1 is specifically carved out as a "potentially
+# trustworthy origin" by browsers even over plain HTTP, so serving the exact
+# same page from there over loopback-only HTTP fixes it with no other change
+# in behavior (nothing here is reachable from outside this machine).
+class _AppRequestHandler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/html; charset=utf-8')
+        self.end_headers()
+        self.wfile.write(HTML.encode('utf-8'))
+    def log_message(self, format, *args):
+        pass  # keep the app's own console output clean
+
+def _start_local_server():
+    server = http.server.HTTPServer(('127.0.0.1', 0), _AppRequestHandler)
+    port = server.server_address[1]
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return port
 
 def main():
     api = Api()
+    port = _start_local_server()
     window = webview.create_window(
         'Drone Mission Planner',
-        html=HTML,
+        url=f'http://127.0.0.1:{port}/',
         js_api=api,
         width=1500, height=900,
         min_size=(1000, 650),
