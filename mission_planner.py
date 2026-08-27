@@ -1967,6 +1967,20 @@ details .details-body{padding:2px 10px 10px;}
   background:#0a0a0ae8;border:1px solid var(--orange);border-radius:var(--radius);padding:8px 18px;
   font-size:12px;color:#fff;display:none;pointer-events:none;box-shadow:0 4px 16px #000a;}
 #draw-hint.visible{display:block;}
+#map-search{position:absolute;top:12px;left:12px;z-index:900;display:flex;gap:6px;}
+#map-search input{width:230px;background:#0a0a0ae8;border:1px solid var(--border2);color:var(--text);
+  border-radius:var(--radius-sm);padding:7px 10px;font-size:12.5px;box-shadow:0 4px 16px #000a;}
+#map-search input:focus{border-color:var(--orange);outline:none;}
+#map-search button{padding:6px 10px;box-shadow:0 4px 16px #000a;}
+#map-search-results{position:absolute;top:50px;left:12px;z-index:900;width:230px;max-height:260px;
+  overflow-y:auto;background:#0a0a0ae8;border:1px solid var(--border2);border-radius:var(--radius);
+  box-shadow:0 4px 16px #000a;display:none;}
+#map-search-results.visible{display:block;}
+#map-search-results .result-item{padding:8px 10px;font-size:11.5px;color:var(--text);cursor:pointer;
+  border-bottom:1px solid var(--border);line-height:1.4;}
+#map-search-results .result-item:last-child{border-bottom:none;}
+#map-search-results .result-item:hover{background:var(--bg4);}
+#map-search-results .result-empty{padding:10px;font-size:11.5px;color:var(--text-faint);}
 
 .wp-marker{width:22px;height:22px;border-radius:50%;background:var(--orange);border:2px solid #000;
   color:#000;font-size:10px;font-weight:800;display:flex;align-items:center;justify-content:center;
@@ -2084,6 +2098,12 @@ details .details-body{padding:2px 10px 10px;}
   </div>
   <div id="content">
     <div id="draw-hint"></div>
+    <div id="map-search">
+      <input id="map-search-input" type="text" placeholder="Search a place or address…" onkeydown="if(event.key==='Enter') mapSearch()">
+      <button onclick="mapSearch()" title="Search">🔍</button>
+      <button onclick="mapGeolocate()" title="Go to my location">📍</button>
+    </div>
+    <div id="map-search-results"></div>
     <div id="map"></div>
   </div>
 </div>
@@ -2328,6 +2348,14 @@ var baseStreets = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.pn
   {maxZoom:22, maxNativeZoom:19, attribution:'&copy; OpenStreetMap'});
 var baseSatellite = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
   {maxZoom:23, maxNativeZoom:23, attribution:'Tiles &copy; Esri'});
+// Google's raw tile endpoint isn't an official/licensed API -- there's no key, no
+// SLA, and it's outside Google's terms of service for map tile access, but it's
+// the same well-known trick most hobby GIS/drone-planning tools use to get
+// satellite imagery that's often higher native resolution than Esri's in a given
+// area (varies by region -- neither source is uniformly better everywhere). It
+// can be blocked or rate-limited without notice since it's unofficial.
+var baseGoogleSat = L.tileLayer('https://{s}.google.com/vt/lyrs=s&x={x}&y={y}&z={z}',
+  {subdomains:['mt0','mt1','mt2','mt3'], maxZoom:22, maxNativeZoom:21, attribution:'Imagery &copy; Google (unofficial tile access)'});
 var baseSatelliteLabels = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}',
   {maxZoom:23, maxNativeZoom:19, attribution:'Esri', pane:'shadowPane'});
 var baseTopo = L.tileLayer('https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png',
@@ -2342,14 +2370,18 @@ var wpGroup = L.layerGroup().addTo(map);
 var snapGroup = L.layerGroup().addTo(map);
 var exclusionGroup = L.layerGroup().addTo(map);
 var gcpGroup = L.layerGroup().addTo(map);
+var geoGroup = L.layerGroup().addTo(map); // "you are here" marker from the geolocate button, kept separate from tempGroup so it isn't wiped by cancelDraw()
 var wpPathLayer = null;
 var wpMarkers = {};
 
 var satelliteHybrid = L.layerGroup([baseSatellite, baseSatelliteLabels]);
+var googleSatHybrid = L.layerGroup([baseGoogleSat, baseSatelliteLabels]);
 L.control.layers({
   'Street': baseStreets,
-  'Satellite': satelliteHybrid,
-  'Satellite (no labels)': baseSatellite,
+  'Satellite (Esri)': satelliteHybrid,
+  'Satellite (Esri, no labels)': baseSatellite,
+  'Satellite (Google)': googleSatHybrid,
+  'Satellite (Google, no labels)': baseGoogleSat,
   'Topographic': baseTopo,
   'Dark': baseDark,
 }, {
@@ -2358,6 +2390,65 @@ L.control.layers({
   'No-fly / exclusion zones': exclusionGroup,
   'Ground control points': gcpGroup,
 }, {position:'topright', collapsed:true}).addTo(map);
+
+// ── Map search / geolocate ──────────────────────────────────────────────────
+// Nominatim (OpenStreetMap's free geocoder) -- no API key, but rate-limited to
+// ~1 req/sec by its usage policy, which a single interactive search box stays
+// well under.
+function mapSearch(){
+  var input = document.getElementById('map-search-input');
+  var q = input.value.trim();
+  var resultsEl = document.getElementById('map-search-results');
+  if(!q){ resultsEl.classList.remove('visible'); return; }
+  resultsEl.innerHTML = '<div class="result-empty">Searching…</div>';
+  resultsEl.classList.add('visible');
+  fetch('https://nominatim.openstreetmap.org/search?format=json&limit=6&q=' + encodeURIComponent(q))
+    .then(function(r){ return r.json(); })
+    .then(function(results){
+      if(!results || !results.length){
+        resultsEl.innerHTML = '<div class="result-empty">No results found.</div>';
+        return;
+      }
+      resultsEl.innerHTML = '';
+      results.forEach(function(r){
+        var item = document.createElement('div');
+        item.className = 'result-item';
+        item.textContent = r.display_name;
+        item.onclick = function(){
+          var lat = parseFloat(r.lat), lon = parseFloat(r.lon);
+          map.setView([lat, lon], 17);
+          resultsEl.classList.remove('visible');
+          resultsEl.innerHTML = '';
+        };
+        resultsEl.appendChild(item);
+      });
+    })
+    .catch(function(){
+      resultsEl.innerHTML = '<div class="result-empty">Search failed -- check your internet connection.</div>';
+    });
+}
+function mapGeolocate(){
+  if(!navigator.geolocation){
+    alert('Geolocation is not available in this window.');
+    return;
+  }
+  setStatus('Locating…');
+  navigator.geolocation.getCurrentPosition(function(pos){
+    var lat = pos.coords.latitude, lon = pos.coords.longitude;
+    map.setView([lat, lon], 17);
+    geoGroup.clearLayers();
+    L.circleMarker([lat, lon], {radius:8, color:'#3b82f6', weight:2, fillColor:'#3b82f6', fillOpacity:.5})
+      .bindTooltip('Your location').addTo(geoGroup);
+    setStatus('Ready');
+  }, function(err){
+    // WebView2's own geolocation permission prompt (a bar at the top of the
+    // window, not this app's UI) has to be accepted for this to work at all --
+    // a denial or an unsupported host surfaces here as a plain error message
+    // rather than this app silently doing nothing.
+    setStatus('Ready');
+    alert('Could not get your location: ' + err.message);
+  }, {enableHighAccuracy:true, timeout:12000});
+}
 
 // ── Init ───────────────────────────────────────────────────────────────────
 function init(){
