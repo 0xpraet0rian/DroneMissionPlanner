@@ -1963,7 +1963,15 @@ details .details-body{padding:2px 10px 10px;}
 /* ── Map area ── */
 #content{flex:1;display:flex;flex-direction:column;overflow:hidden;position:relative;}
 #map{flex:1;width:100%;}
-#draw-hint{position:absolute;top:12px;left:50%;transform:translateX(-50%);z-index:900;
+/* Centered in the space to the RIGHT of the reserved 258px search column
+   (12px margin + ~230px search bar/results width), not the full map width --
+   a plain 50% center still reaches back far enough at the app's minimum
+   window size (1000px, ~670px of map) to collide with #map-search /
+   #map-search-results if both are visible at once (drawing while a search
+   dropdown is open). This stays clear at any supported window width instead
+   of relying on tuned pixel margins that only work at one size. */
+#draw-hint{position:absolute;top:12px;left:calc(258px + (100% - 258px)/2);
+  transform:translateX(-50%);z-index:900;
   background:#0a0a0ae8;border:1px solid var(--orange);border-radius:var(--radius);padding:8px 18px;
   font-size:12px;color:#fff;display:none;pointer-events:none;box-shadow:0 4px 16px #000a;}
 #draw-hint.visible{display:block;}
@@ -2338,7 +2346,10 @@ function refreshEstimate(){
     extraStats + camNote + warn;
 }
 
-var map = L.map('map', {preferCanvas:true}).setView([45.35,22.28], 12);
+// zoomControl:false + added back at bottomleft -- Leaflet's default top-left
+// zoom control would otherwise sit directly under #map-search (also top-left).
+var map = L.map('map', {preferCanvas:true, zoomControl:false}).setView([45.35,22.28], 12);
+L.control.zoom({position:'bottomleft'}).addTo(map);
 
 // ── Base layers (switchable) ────────────────────────────────────────────────
 // maxNativeZoom is where the tile provider's real imagery stops; Leaflet upscales
