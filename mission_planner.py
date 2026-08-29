@@ -27,6 +27,8 @@ import http.server
 import xml.etree.ElementTree as ET
 import webview
 
+APP_VERSION = '1.2'
+
 # ── Geo helpers ─────────────────────────────────────────────────────────────
 
 EARTH_R = 6_371_000.0
@@ -203,15 +205,10 @@ def parse_geometries(root):
                         coords = _parse_coord_text(c.text)
                         if len(coords) < 2:
                             continue
-                        # Some tools (CAD/GIS exports especially) save a
-                        # closed area as a LineString that returns to its
-                        # own start point instead of a proper <Polygon> tag.
-                        # Detect that (>=4 points, first and last within a
-                        # couple meters of each other) and treat it as an
-                        # area, not a route -- otherwise it only offers "use
-                        # as corridor," which buffers along it as if flying
-                        # a road, when the shape was actually meant as a
-                        # survey boundary.
+                        # CAD/GIS exports often save a closed area as a
+                        # LineString returning to its start rather than a
+                        # <Polygon>. Treat that as an area, or it would only
+                        # be offered as a corridor and buffered like a road.
                         closed = (len(coords) >= 4
                                   and haversine_m(coords[0][0], coords[0][1], coords[-1][0], coords[-1][1]) < 2.0)
                         if closed:
@@ -249,15 +246,10 @@ def parse_kml_kmz(path):
     return polygons, lines, points
 
 # ── Drone / camera presets ───────────────────────────────────────────────────
-# droneEnumValue=68: no official DJI docs for consumer drones (the Cloud API/WPML
-# spec only covers enterprise models). YMapper's author found this value works
-# for DJI Fly regardless of which consumer drone is connected, so we match it.
-#
-# Camera specs (sensor mm, focal length, resolution) come from YMapper's own
-# preset table, cross-checked against DJI's spec pages for the Mini 4/5 Pro.
-# Footprint = altitude * sensorSize / focalLength, same physical model YMapper
-# uses. The Mini 5 Pro's 1" sensor is genuinely bigger than the Mini 4 Pro's
-# 1/1.3" — not just a label difference, it changes the numbers.
+# droneEnumValue=68 works for DJI Fly on any consumer drone (per YMapper);
+# DJI's WPML spec only documents enterprise models. Camera specs come from
+# YMapper's preset table, cross-checked against DJI's Mini 4/5 Pro spec pages.
+# Footprint = altitude * sensorSize / focalLength.
 
 # ── Gimbal pitch presets ──────────────────────────────────────────────────
 # -90° = straight down (nadir), 0° = horizontal, DJI/WPML convention.
@@ -381,44 +373,25 @@ DEFAULT_MISSION_CONFIG = {
     'orbitTurnMode': 'toPointAndPassWithContinuityCurvature',
     'overviewEnabled': False, 'overviewAltitude': 0, 'overviewGimbal': -60,
     'delayAtWaypoint': 0,
-    # Distance/speed alone assumes the aircraft is instantly at cruise speed and
-    # stops instantly too -- physically impossible, and badly wrong for the
-    # default stop-and-rotate turn mode with tightly-spaced waypoints, where the
-    # aircraft may never even reach cruise speed before decelerating for the next
-    # stop. 1.4 m/s^2 is the measured average accel/decel for a small quadcopter
-    # in acceleration-aware waypoint path-planning research (Xu et al., 2021,
-    # MDPI Drones journal), which found ignoring this inflates flight-time
-    # accuracy errors by up to 1.7x versus reality -- exactly this effect.
+    # Distance/speed assumes instant acceleration, which is badly wrong for
+    # tightly-spaced stop-and-rotate waypoints where cruise speed is never
+    # reached. 1.4 m/s^2 is the measured small-quadcopter average from Xu et
+    # al., 2021 (MDPI Drones); ignoring it skews flight time by up to 1.7x.
     'droneAccel': 1.4,
-    # DJI Fly currently caps a single waypoint mission at 200 waypoints on the
-    # Mini 5 Pro and other current consumer models, but real-world reports of
-    # the RC2's own mission UI destabilizing on mapping-style missions --
-    # many closely-packed points, exactly what a grid survey produces --
-    # describe trouble starting around 70+, independent of this app or any
-    # multi-battery concern. 90 stays safely under both. Editable, since
-    # tolerances vary by RC2 firmware version and mission shape.
+    # DJI Fly caps a mission at 200 waypoints, but the RC2's own mission UI is
+    # reported to destabilise from ~70+ on closely-packed mapping missions.
+    # 90 stays under both; editable since tolerances vary by firmware.
     'maxWaypointsPerFile': 90,
-    # Grid/corridor missions no longer put a real waypoint at every photo --
-    # confirmed (DJI's own consumer waypoint docs, and independent real-world
-    # reports) that distance/time-interval WPML photo triggers aren't reliably
-    # available on consumer DJI Fly, and that per-photo stop-and-shoot
-    # waypoints cause both position-hold jitter and RC2 mission-count
-    # instability. Instead: fly each row as one continuous line at a speed
-    # derived from this fixed interval (forward_spacing / cameraInterval), and
-    # set the camera's own Timer/interval-shooting mode to this value manually
-    # before starting the mission -- the app can prompt for that step but
-    # can't do it for you, since it isn't something a WPML file can encode for
-    # consumer hardware. 2.0s matches the workflow HOT's drone-flightplan (a
-    # production tool used for real humanitarian drone mapping) documents for
-    # exactly this purpose, and is comfortably within every DJI camera's
-    # continuous-shooting capability even at high resolution/RAW.
+    # WPML distance/time photo triggers aren't reliably available on consumer
+    # DJI Fly, so grid/corridor rows fly continuously at a speed derived from
+    # this interval (forward_spacing / cameraInterval) while the camera's own
+    # Timer mode fires the shutter. That timer MUST be set manually pre-flight;
+    # no WPML field can do it on consumer hardware. 2.0s matches HOT's
+    # drone-flightplan and suits every DJI camera even shooting RAW.
     'cameraInterval': 2.0,
-    # 'turnOnly' (default): sparse waypoints, camera fires on its own fixed
-    # interval timer -- see cameraInterval's comment above. 'full': a real
-    # waypoint at every photo, no manual step needed, but real flight testing
-    # confirmed it causes position-hold jitter and can hit the RC2's mission-
-    # count limits on a dense grid. Matches the same choice YMapper and
-    # Waypoint OS both expose (checked their actual output, not just docs).
+    # 'turnOnly' (default): sparse waypoints, camera on its own interval timer
+    # (see cameraInterval). 'full': a waypoint per photo -- no manual step, but
+    # jitter-prone and can hit RC2 waypoint limits. Both mirror YMapper/Waypoint OS.
     'waypointMode': 'turnOnly',
     'flyToWaylineMode': 'safely', 'finishAction': 'goHome',
     'exitOnRCLost': 'executeLostAction', 'executeRCLostAction': 'goBack',
@@ -460,83 +433,415 @@ def _point_in_polygon(x, y, poly):
 def _in_any_polygon(x, y, polys):
     return any(_point_in_polygon(x, y, p) for p in polys) if polys else False
 
-def _dist_point_to_segment(px, py, ax, ay, bx, by):
-    dx, dy = bx - ax, by - ay
-    if dx == 0 and dy == 0:
-        return math.hypot(px - ax, py - ay)
-    t = max(0.0, min(1.0, ((px - ax) * dx + (py - ay) * dy) / (dx * dx + dy * dy)))
-    return math.hypot(px - (ax + t * dx), py - (ay + t * dy))
-
-def _dist_point_to_polygon_boundary(x, y, poly):
+def _scanline_intervals(y, poly):
+    """Exact x-intervals where the horizontal line at `y` lies inside the
+    polygon (even-odd rule) -- the classic scanline fill: collect every edge
+    crossing, sort, and pair them up. Half-open (y1 > y) != (y2 > y) test so
+    a line exactly through a vertex counts each edge once instead of twice,
+    and horizontal edges are skipped consistently."""
+    xs = []
     n = len(poly)
-    return min(_dist_point_to_segment(x, y, poly[i][0], poly[i][1], poly[(i + 1) % n][0], poly[(i + 1) % n][1])
-               for i in range(n))
+    for i in range(n):
+        x1, y1 = poly[i]
+        x2, y2 = poly[(i + 1) % n]
+        if (y1 > y) != (y2 > y):
+            xs.append(x1 + (y - y1) * (x2 - x1) / (y2 - y1))
+    xs.sort()
+    return [(xs[i], xs[i + 1]) for i in range(0, len(xs) - 1, 2)]
 
-def _near_polygon(x, y, poly, margin):
-    """Inside the polygon, OR just outside but within `margin` of its boundary.
-    A boundary is where the surveyed site ends, not a fence the sweep must
-    stay strictly inside of -- a sample just past the edge still has a real
-    photo footprint covering the boundary, and the DJI Mini 5 Pro's own real
-    footprint overlap makes a little overshoot free extra coverage, not a
-    flaw. Without this, rows near a polygon's corners (worse the more the
-    sweep angle is skewed from the shape) get clipped short for no operational
-    reason, which is what produced the ragged/short-row pattern -- confirmed
-    by direct test: a sweep whose rotation exactly matches the polygon's true
-    orientation still tapers at the tips without this margin."""
-    if margin <= 0:
-        return _point_in_polygon(x, y, poly)
-    return _point_in_polygon(x, y, poly) or _dist_point_to_polygon_boundary(x, y, poly) <= margin
+def _subtract_intervals(intervals, holes):
+    """Cut hole intervals out of coverage intervals -- how a no-fly zone
+    splits a scan row into separate flyable stretches, exactly at the zone's
+    true boundary rather than at the nearest sample point."""
+    out = list(intervals)
+    for h0, h1 in holes:
+        nxt = []
+        for a, b in out:
+            if h1 <= a or h0 >= b:
+                nxt.append((a, b))
+                continue
+            if h0 > a:
+                nxt.append((a, h0))
+            if h1 < b:
+                nxt.append((h1, b))
+        out = nxt
+    return out
+
+def _offset_polygon(poly, dist):
+    """Dilate a simple polygon outward by `dist` with mitered corners -- a
+    real polygon offset, not a scale about the centroid.
+
+    Needed because the coverage margin has to apply evenly all the way round
+    the shape. Scaling from the centroid would push a long thin site out
+    mostly along its length and barely across its width, and clamping rows
+    onto the polygon's extreme edge (the previous approach) is worse still:
+    at the very tip of a rotated shape the scan line catches a near-zero
+    slice, which the margin then inflated into a short stub row jutting out
+    of the site -- the stray corner waypoints reported on a real 174x28 m
+    survey area.
+    """
+    if dist == 0 or len(poly) < 3:
+        return list(poly)
+    pts = list(poly)
+    n = len(pts)
+    # Outward normals are only well defined for a known winding; force CCW.
+    area2 = sum(pts[i][0] * pts[(i + 1) % n][1] - pts[(i + 1) % n][0] * pts[i][1]
+                for i in range(n))
+    if area2 < 0:
+        pts.reverse()
+    normals = []
+    for i in range(n):
+        ax, ay = pts[i]
+        bx, by = pts[(i + 1) % n]
+        dx, dy = bx - ax, by - ay
+        L = math.hypot(dx, dy) or 1.0
+        normals.append((dy / L, -dx / L))  # outward for CCW winding
+    out = []
+    for i in range(n):
+        px, py = normals[i - 1]   # edge arriving at vertex i
+        nx, ny = normals[i]       # edge leaving vertex i
+        mx, my = px + nx, py + ny
+        ml = math.hypot(mx, my)
+        if ml < 1e-9:            # spike vertex, edges exactly opposed
+            out.append((pts[i][0] + nx * dist, pts[i][1] + ny * dist))
+            continue
+        mx, my = mx / ml, my / ml
+        cos_half = mx * px + my * py
+        # Cap the miter so a sharp corner bevels instead of shooting a long
+        # spike out of the shape.
+        out.append((pts[i][0] + mx * (dist / max(0.35, cos_half)),
+                    pts[i][1] + my * (dist / max(0.35, cos_half))))
+    return out
 
 def _sweep_coverage_rows(rpts, side_spacing, forward_spacing, exclude_polys=None, boundary_margin=0.0):
-    """Boustrophedon (lawnmower) sweep across the polygon's bounding box, keeping
-    only in-polygon sample points and snapping each row's last point out to the
-    true edge so rows don't stop short. Returns a list of ROWS (each a list of
-    dense sample points), not a flat list -- see _sweep_coverage for the flat
-    version used for photo-count/estimate math, and generate_grid for why the
-    actual flight path only uses each row's endpoints rather than every dense
-    sample point (real per-photo waypoints, one stop-and-hold per shot, is what
-    caused position-hold jitter and RC2 mission-count instability in practice;
-    see this function's row output used there for the real fix).
-    exclude_polys is a list of hole polygons (same coordinate frame as rpts) —
-    a sample point inside any of them is skipped, same as if it were outside
-    the outer boundary. This can split a single scan row into disconnected
-    stretches of coverage, which is why each row is kept as its own list
-    instead of a flat stream: generate_grid needs the gaps to know where a
-    straight line between two points would cut through a no-fly zone."""
-    xs = [p[0] for p in rpts]
-    ys = [p[1] for p in rpts]
-    minx, maxx = min(xs) - boundary_margin, max(xs) + boundary_margin
-    miny, maxy = min(ys) - boundary_margin, max(ys) + boundary_margin
-    # Stepping rows by a fixed side_spacing from miny can leave up to a whole
-    # side_spacing uncovered at the far (maxy) edge once the span doesn't
-    # divide evenly -- the near edge always lands flush on miny, so any
-    # leftover all piles up on one side, which is what reads as coverage
-    # being "off-center"/lopsided rather than evenly filling the shape.
-    # Distributing the same row count evenly across the full span (never
-    # wider than the requested side_spacing, only tighter) reaches both
-    # edges symmetrically instead.
+    """Boustrophedon (lawnmower) sweep built from EXACT scanline intersections,
+    not a sampled point-in-polygon lattice. For each row, the row's true
+    x-intervals inside the polygon are computed directly (classic scanline
+    fill), so every row starts and ends precisely on the boundary (extended by
+    boundary_margin -- the boundary is where the surveyed site ends, not a
+    fence: a photo footprint reaching slightly past the edge is free coverage,
+    and clipping to the nearest interior sample point is what used to leave
+    rows ragged/short near corners). Photos inside each interval are then
+    spread evenly at <= forward_spacing.
+
+    The previous lattice implementation only snapped each row's FAR end
+    outward (and to the bounding box, not the polygon), so on any shape whose
+    edges aren't parallel to the sweep, rows started up to a full
+    forward_spacing short of the boundary. Scanline makes both ends exact and
+    is also asymptotically cheaper (O(rows*edges) instead of
+    O(rows*samples*edges)).
+
+    Rows are distributed evenly across the span rather than stepped from one
+    edge (which piled all the leftover on the far side and read as lopsided
+    coverage). The boundary margin is applied by genuinely dilating the
+    polygon first (_offset_polygon), so rows in the margin band intersect a
+    real shape. Clamping them onto the original polygon's extreme edge
+    instead -- the previous approach -- caught a near-zero-width slice at the
+    tip of a rotated shape and inflated it into a stub row sticking out of
+    the site.
+
+    exclude_polys are cut out per-row as exact interval subtraction, so a
+    no-fly zone splits a row exactly at the zone boundary. Returns a list of
+    ROWS (each a list of (x, y) sample points); generate_grid keeps only each
+    row's endpoints in Turn Only mode -- see its comment for why."""
+    # Everything below sweeps the DILATED shape, so the margin is already
+    # baked into the geometry and rows need no special casing at the edges.
+    area = _offset_polygon(rpts, boundary_margin) if boundary_margin > 0 else rpts
+    ys = [p[1] for p in area]
+    miny, maxy = min(ys), max(ys)
     span_y = maxy - miny
-    n_rows = max(1, math.ceil(span_y / side_spacing) + 1) if span_y > 0 else 1
-    row_spacing = span_y / (n_rows - 1) if n_rows > 1 else side_spacing
+    # Rows sit at the centres of equal bands, not on the span's extremes. On
+    # any rotated site the outermost point is a corner, so a row placed exactly
+    # there caught a zero-width slice and emitted a stray waypoint outside the
+    # area. Band centres cover the same span with no degenerate rows, whatever
+    # the orientation.
+    n_rows = max(1, math.ceil(span_y / side_spacing)) if span_y > 0 else 1
+    row_spacing = span_y / n_rows if span_y > 0 else side_spacing
+
     rows = []
     reverse = False
     for row_i in range(n_rows):
-        y = miny + row_i * row_spacing
-        line = []
-        x = minx
-        while x <= maxx + 1e-9:
-            if _near_polygon(x, y, rpts, boundary_margin) and not _in_any_polygon(x, y, exclude_polys):
-                line.append((x, y))
-            x += forward_spacing
-        if (line and abs(maxx - line[-1][0]) > 1e-6 and _near_polygon(maxx, y, rpts, boundary_margin)
-                and not _in_any_polygon(maxx, y, exclude_polys)):
-            line.append((maxx, y))
+        y = miny + (row_i + 0.5) * row_spacing
+        intervals = _scanline_intervals(y, area)
+        if exclude_polys:
+            holes = []
+            for hp in exclude_polys:
+                holes.extend(_scanline_intervals(y, hp))
+            intervals = _subtract_intervals(intervals, holes)
+        segments = []
+        for a, b in intervals:
+            length = b - a
+            if length < 0.5:
+                # Degenerate sliver (a polygon tip, or what's left beside a
+                # hole) -- one photo at its middle instead of two coincident
+                # endpoints pretending to be a flyable stretch.
+                segments.append([((a + b) / 2, y)])
+                continue
+            n_steps = max(1, math.ceil(length / forward_spacing))
+            step = length / n_steps
+            segments.append([(a + k * step, y) for k in range(n_steps + 1)])
         if reverse:
-            line.reverse()
-        if line:
-            rows.append(line)
+            segments.reverse()
+            for seg in segments:
+                seg.reverse()
+        if segments:
+            rows.append(segments)
         reverse = not reverse
     return rows
+
+def _decompose_into_cells(rows):
+    """Boustrophedon CELLULAR decomposition.
+
+    A no-fly zone (or a concave boundary) splits one scan row into several
+    disconnected stretches. Flying them in plain row order -- end of stretch A
+    straight to start of stretch B -- sends the aircraft directly across the
+    gap between them, which is exactly the zone it was supposed to avoid.
+    Confirmed by direct test before this existed: an L-shaped area with one
+    no-fly box produced 3 legs passing right through the box.
+
+    The standard fix (and what real coverage-path planners do) is to treat the
+    free space as separate CELLS: link each row's stretch to the stretch it
+    overlaps in the previous row, and fly each connected cell as its own
+    serpentine. Where a row's stretch splits in two, or two merge into one,
+    that's a critical point -- the affected cells are closed and new ones
+    opened, so no path ever spans a gap.
+
+    Takes rows (list of rows; each a list of segments; each segment a list of
+    same-y points) and returns a list of cells, each a list of segments in
+    flight order.
+    """
+    def extent(seg):
+        xs = [p[0] for p in seg]
+        return min(xs), max(xs)
+
+    def overlaps(a, b):
+        # Touching-only counts as disconnected: two stretches that merely meet
+        # at a hole's edge are on opposite sides of it.
+        return a[0] < b[1] - 1e-9 and b[0] < a[1] - 1e-9
+
+    open_cells = []   # each: {'segments': [...], 'extent': (lo, hi)}
+    finished = []
+    for row in rows:
+        exts = [extent(s) for s in row]
+        # Match this row's segments against the currently open cells.
+        seg_to_cells = [[ci for ci, c in enumerate(open_cells) if overlaps(exts[si], c['extent'])]
+                        for si in range(len(row))]
+        cell_to_segs = [[si for si in range(len(row)) if ci in seg_to_cells[si]]
+                        for ci in range(len(open_cells))]
+        next_open = []
+        used = set()
+        for si, seg in enumerate(row):
+            cands = seg_to_cells[si]
+            # Continue an existing cell only on a clean 1:1 continuation --
+            # a split (one cell feeding several segments) or a merge (several
+            # cells feeding one segment) is a critical point, so those cells
+            # are closed and fresh ones start here.
+            if len(cands) == 1 and len(cell_to_segs[cands[0]]) == 1:
+                cell = open_cells[cands[0]]
+                cell['segments'].append(seg)
+                cell['extent'] = exts[si]
+                next_open.append(cell)
+                used.add(cands[0])
+            else:
+                next_open.append({'segments': [seg], 'extent': exts[si]})
+                for ci in cands:
+                    if ci not in used:
+                        finished.append(open_cells[ci])
+                        used.add(ci)
+        # Any open cell this row didn't touch at all has ended.
+        for ci, c in enumerate(open_cells):
+            if ci not in used and c not in next_open:
+                finished.append(c)
+        open_cells = next_open
+    finished.extend(open_cells)
+
+    # Serpentine within each cell: alternate direction row to row so the
+    # aircraft turns at the end of each pass instead of deadheading back.
+    cells = []
+    for c in finished:
+        segs = []
+        for i, seg in enumerate(c['segments']):
+            s = list(seg)
+            # Normalise to a known direction first, then alternate -- the raw
+            # segments already carry the sweep's own global alternation, which
+            # doesn't survive being regrouped into cells.
+            if s[0][0] > s[-1][0]:
+                s.reverse()
+            if i % 2 == 1:
+                s.reverse()
+            segs.append(s)
+        if segs:
+            cells.append(segs)
+    return _order_cells(cells)
+
+def _reverse_cell(cell):
+    """Fly the same cell from its other end: rows bottom-to-top instead of
+    top-to-bottom, each row's direction flipped to keep the serpentine."""
+    return [list(reversed(seg)) for seg in reversed(cell)]
+
+def _order_cells(cells):
+    """Greedy nearest-neighbour ordering, picking each cell's traversal
+    direction too.
+
+    Cells come out of the decomposition in the order the sweep happened to
+    create them, so the aircraft could finish one cell and then deadhead
+    right across the site to start the next -- clearly visible as long
+    diagonals in a rendered path. Choosing the nearest remaining cell, and
+    whichever of its two ends is closer, keeps those transits short. Greedy
+    rather than optimal: this is a small open-TSP instance, and the exact
+    answer isn't worth the runtime for a handful of cells.
+    """
+    if len(cells) <= 1:
+        return cells
+    remaining = list(cells)
+    # Start from the cell containing the lowest row, so the mission still
+    # begins at a predictable edge of the site rather than somewhere random.
+    start = min(remaining, key=lambda c: (c[0][0][1], c[0][0][0]))
+    remaining.remove(start)
+    ordered = [start]
+    cur = start[-1][-1]
+    while remaining:
+        best = None
+        for c in remaining:
+            for cand in (c, _reverse_cell(c)):
+                d = math.hypot(cand[0][0][0] - cur[0], cand[0][0][1] - cur[1])
+                if best is None or d < best[0]:
+                    best = (d, c, cand)
+        _, original, chosen = best
+        remaining.remove(original)
+        ordered.append(chosen)
+        cur = chosen[-1][-1]
+    return ordered
+
+def _segments_cross(a, b, c, d):
+    """Proper segment intersection (shared endpoints / touching don't count)."""
+    def orient(p, q, r):
+        v = (q[0] - p[0]) * (r[1] - p[1]) - (q[1] - p[1]) * (r[0] - p[0])
+        return 0 if abs(v) < 1e-12 else (1 if v > 0 else -1)
+    o1, o2 = orient(a, b, c), orient(a, b, d)
+    o3, o4 = orient(c, d, a), orient(c, d, b)
+    return 0 not in (o1, o2, o3, o4) and o1 != o2 and o3 != o4
+
+def _seg_enters_poly(a, b, poly):
+    """True if the straight leg a->b passes through the polygon's interior."""
+    if _point_in_polygon(a[0], a[1], poly) or _point_in_polygon(b[0], b[1], poly):
+        return True
+    n = len(poly)
+    return any(_segments_cross(a, b, poly[i], poly[(i + 1) % n]) for i in range(n))
+
+def _expand_poly(poly, margin):
+    """Push every vertex outward from the centroid so the routed path clears
+    the real zone by a margin instead of grazing its exact edge. A negative
+    margin shrinks instead, which is how the interior-only test polygon is
+    built (see _route_around_exclusions)."""
+    if margin == 0 or len(poly) < 3:
+        return list(poly)
+    cx = sum(p[0] for p in poly) / len(poly)
+    cy = sum(p[1] for p in poly) / len(poly)
+    out = []
+    for x, y in poly:
+        dx, dy = x - cx, y - cy
+        d = math.hypot(dx, dy) or 1.0
+        out.append((x + dx / d * margin, y + dy / d * margin))
+    return out
+
+def _detour_around(a, b, hull):
+    """Vertices to route through so a->b goes AROUND a convex hull instead of
+    across it. Both ways round are built (the hull vertices on either side of
+    the a-b line, ordered along it) and the shorter one wins."""
+    ax, ay = a
+    ex, ey = b[0] - ax, b[1] - ay
+    length = math.hypot(ex, ey) or 1.0
+    def side(p):
+        return ex * (p[1] - ay) - ey * (p[0] - ax)
+    def along(p):
+        return ((p[0] - ax) * ex + (p[1] - ay) * ey) / length
+    best = None
+    for group in ([v for v in hull if side(v) > 0], [v for v in hull if side(v) < 0]):
+        if not group:
+            continue
+        ordered = sorted(group, key=along)
+        path = [a] + ordered + [b]
+        dist = sum(math.hypot(path[i + 1][0] - path[i][0], path[i + 1][1] - path[i][1])
+                   for i in range(len(path) - 1))
+        if best is None or dist < best[0]:
+            best = (dist, ordered)
+    return list(best[1]) if best else []
+
+def _route_around_exclusions(points, exclude_polys, margin):
+    """Insert transit waypoints so no straight leg ever crosses a no-fly zone.
+
+    Splitting rows at zone boundaries is not enough on its own: the aircraft
+    still flies from the end of one stretch to the start of the next, and from
+    the last row of one cell to the first row of the next -- both of which can
+    cut straight across the zone. Verified before this existed: five different
+    area/zone layouts produced 2-7 zone-crossing legs each, even with cellular
+    decomposition already in place.
+
+    Each offending leg is re-routed around the offending zone's expanded
+    convex hull. A hull is used rather than the raw polygon because it is
+    guaranteed to contain the zone (so clearing the hull clears the zone) and
+    is convex, which makes "go around one side" well defined.
+
+    points: list of (x, y). Returns list of (x, y, is_detour), where
+    is_detour marks inserted transit points that must not take a photo --
+    they sit outside the surveyed area by construction.
+    """
+    if not exclude_polys or len(points) < 2:
+        return [(p[0], p[1], False) for p in points]
+    # Two polygons per zone, and the sizes matter:
+    #  * TEST is the hull shrunk slightly, i.e. the zone's interior. It must
+    #    NOT be expanded: rows legitimately end exactly ON the boundary, and
+    #    such an endpoint would sit inside an expanded hull, so every leg from
+    #    there reports a hit no re-routing can clear (42 endpoints ballooned to
+    #    350 waypoints). Shrinking keeps boundary endpoints outside while still
+    #    catching any leg that truly cuts through.
+    #  * ROUTE is expanded by the full margin so transit points clear the zone.
+    zones = []
+    for p in exclude_polys:
+        base = _convex_hull(list(p))
+        if len(base) < 3:
+            continue
+        zones.append((_expand_poly(base, -0.05), _expand_poly(base, margin)))
+    if not zones:
+        return [(p[0], p[1], False) for p in points]
+
+    def first_hit(p, q):
+        for test_hull, route_hull in zones:
+            if _seg_enters_poly(p, q, test_hull):
+                return route_hull
+        return None
+
+    out = [(points[0][0], points[0][1], False)]
+    for i in range(1, len(points)):
+        leg = [(out[-1][0], out[-1][1]), points[i]]
+        # A detour can itself clip a different zone, so re-check until clear.
+        # The cap stops a pathological layout from looping forever; if it is
+        # hit the leg is emitted as-is rather than silently dropping coverage.
+        for _ in range(8):
+            changed = False
+            rebuilt = [leg[0]]
+            for j in range(1, len(leg)):
+                p, q = leg[j - 1], leg[j]
+                route_hull = first_hit(p, q)
+                if route_hull:
+                    detour = _detour_around(p, q, route_hull)
+                    if detour:
+                        rebuilt.extend(detour)
+                        changed = True
+                rebuilt.append(q)
+            leg = rebuilt
+            if not changed:
+                break
+        for p in leg[1:-1]:
+            # Skip a detour point that coincides with what's already there --
+            # routing two consecutive legs around the same corner otherwise
+            # emits the same vertex twice, which is a zero-length flight leg.
+            if math.hypot(p[0] - out[-1][0], p[1] - out[-1][1]) < 0.05:
+                continue
+            out.append((p[0], p[1], True))
+        out.append((points[i][0], points[i][1], False))
+    return out
 
 def _sweep_coverage(rpts, side_spacing, forward_spacing, exclude_polys=None, boundary_margin=0.0):
     """Flat dense sample list -- the real per-photo positions, used for photo-
@@ -544,23 +849,122 @@ def _sweep_coverage(rpts, side_spacing, forward_spacing, exclude_polys=None, bou
     actual flight path generate_grid builds does NOT fly to each of these; see
     _sweep_coverage_rows."""
     rows = _sweep_coverage_rows(rpts, side_spacing, forward_spacing, exclude_polys, boundary_margin)
-    return [pt for row in rows for pt in row]
+    return [pt for row in rows for seg in row for pt in seg]
 
-def _split_row_gaps(row, forward_spacing):
-    """A row can have gaps where a no-fly zone cut through it -- detect a jump
-    much bigger than the normal sample spacing and split into separate
-    flyable segments, so a sparse start/end waypoint pair never draws a
-    straight line through an excluded area."""
-    if not row:
-        return []
-    gap = forward_spacing * 1.5
-    segments = [[row[0]]]
-    for i in range(1, len(row)):
-        dx, dy = row[i][0] - row[i - 1][0], row[i][1] - row[i - 1][1]
-        if math.hypot(dx, dy) > gap:
-            segments.append([])
-        segments[-1].append(row[i])
-    return segments
+def _polyline_offset(pts, dist):
+    """Offset an open polyline sideways by `dist` (positive = left of travel).
+
+    Offsetting each SAMPLE by its own segment's perpendicular -- what the
+    corridor used to do -- breaks down at every bend: the samples either side
+    of a vertex use different headings, so the offset path steps sideways
+    there, leaving notches and outward spikes exactly at the route's corners.
+    Offsetting the polyline itself with miter joins keeps the passes cleanly
+    parallel. The miter is capped so a hairpin bend can't fling a pass far
+    away from the route.
+    """
+    n = len(pts)
+    if n < 2 or dist == 0:
+        return list(pts)
+    normals = []
+    for i in range(n - 1):
+        dx, dy = pts[i + 1][0] - pts[i][0], pts[i + 1][1] - pts[i][1]
+        L = math.hypot(dx, dy) or 1.0
+        normals.append((-dy / L, dx / L))
+    out = []
+    for i, pt in enumerate(pts):
+        if i == 0:
+            nx, ny = normals[0]
+            out.append((pt[0] + nx * dist, pt[1] + ny * dist))
+        elif i == n - 1:
+            nx, ny = normals[-1]
+            out.append((pt[0] + nx * dist, pt[1] + ny * dist))
+        else:
+            (ax, ay), (bx, by) = normals[i - 1], normals[i]
+            mx, my = ax + bx, ay + by
+            ml = math.hypot(mx, my)
+            if ml < 1e-9:  # route doubles straight back on itself
+                out.append((pt[0] + ax * dist, pt[1] + ay * dist))
+                continue
+            mx, my = mx / ml, my / ml
+            cos_half = mx * ax + my * ay
+            # Cap the miter at 2x the offset distance. Uncapped, a sharp bend
+            # sends the outer pass's corner point far off the route (the
+            # miter length is dist/cos(half-angle), which runs away as the
+            # turn tightens); clamping bevels the corner instead, which is
+            # what a flight path wants.
+            miter = dist / max(0.5, cos_half)
+            out.append((pt[0] + mx * miter, pt[1] + my * miter))
+    return out
+
+def _polyline_extend(pts, amount):
+    """Push both ends outward along their own direction so a pass overshoots
+    the route's end instead of stopping exactly on it -- same reasoning as the
+    grid's boundary margin: a photo slightly past the end is free coverage,
+    while stopping short leaves the end of the corridor thin."""
+    if amount <= 0 or len(pts) < 2:
+        return list(pts)
+    out = list(pts)
+    dx, dy = out[0][0] - out[1][0], out[0][1] - out[1][1]
+    L = math.hypot(dx, dy) or 1.0
+    out[0] = (out[0][0] + dx / L * amount, out[0][1] + dy / L * amount)
+    dx, dy = out[-1][0] - out[-2][0], out[-1][1] - out[-2][1]
+    L = math.hypot(dx, dy) or 1.0
+    out[-1] = (out[-1][0] + dx / L * amount, out[-1][1] + dy / L * amount)
+    return out
+
+def _turn_points(pts, tol_deg=1.0):
+    """Reduce a dense run of photo positions to just the points the aircraft
+    actually has to steer at: the two ends plus every genuine corner.
+
+    Turn Only mode flies each stretch as one continuous line between
+    waypoints, so it only needs the turns -- but taking the first and last
+    point ALONE is only correct when the stretch is straight. A grid row
+    always is; a corridor pass is not: it follows the route's bends, so
+    reducing it to two endpoints made the aircraft fly straight from the
+    start of the route to its end, cutting every corner and abandoning the
+    corridor completely. Keeping direction changes fixes that, and still
+    yields exactly two points for a straight stretch.
+    """
+    if len(pts) < 3:
+        return list(pts)
+    tol = math.radians(tol_deg)
+    out = [pts[0]]
+    for i in range(1, len(pts) - 1):
+        ax, ay = pts[i][0] - pts[i - 1][0], pts[i][1] - pts[i - 1][1]
+        bx, by = pts[i + 1][0] - pts[i][0], pts[i + 1][1] - pts[i][1]
+        if math.hypot(ax, ay) < 1e-9 or math.hypot(bx, by) < 1e-9:
+            continue
+        turn = abs(math.atan2(ax * by - ay * bx, ax * bx + ay * by))
+        if turn > tol:
+            out.append(pts[i])
+    out.append(pts[-1])
+    return out
+
+def _polyline_length(pts):
+    return sum(math.hypot(pts[i + 1][0] - pts[i][0], pts[i + 1][1] - pts[i][1])
+               for i in range(len(pts) - 1))
+
+def _polyline_samples(pts, spacing):
+    """Evenly spaced points along a polyline (step <= spacing, both ends
+    included)."""
+    seglens = [math.hypot(pts[i + 1][0] - pts[i][0], pts[i + 1][1] - pts[i][1])
+               for i in range(len(pts) - 1)]
+    total = sum(seglens)
+    if total <= 0:
+        return [tuple(pts[0])]
+    n = max(1, math.ceil(total / spacing))
+    out, seg_i, acc = [], 0, 0.0
+    for s in range(n + 1):
+        target = total * s / n
+        while seg_i < len(seglens) - 1 and acc + seglens[seg_i] < target:
+            acc += seglens[seg_i]
+            seg_i += 1
+        L = seglens[seg_i] or 1e-9
+        t = min(max((target - acc) / L, 0.0), 1.0)
+        x1, y1 = pts[seg_i]
+        x2, y2 = pts[seg_i + 1]
+        out.append((x1 + (x2 - x1) * t, y1 + (y2 - y1) * t))
+    return out
 
 def _project_exclusions(exclusions_latlon, ref_lat, ref_lon, cf, sf):
     """Exclusion polygons come in as plain lat/lon like the boundary — reproject
@@ -574,15 +978,10 @@ def _project_exclusions(exclusions_latlon, ref_lat, ref_lon, cf, sf):
         out.append([(x * cf - y * sf, x * sf + y * cf) for x, y in exy])
     return out
 
-def grid_photo_points(polygon_latlon, cfg, exclusions_latlon=None):
-    """Dense per-photo sample points for a grid area -- the same geometry
-    generate_grid uses to lay out its sparse row-turn flight path, flattened
-    here for counting/estimating instead. Used for the photo-count estimate
-    and for excluded_count (how many shots a no-fly zone would actually
-    remove), since generate_grid's own output is no longer one entry per
-    photo -- see its comment for why."""
-    if len(polygon_latlon) < 3:
-        return []
+def _grid_rows_for(polygon_latlon, cfg, exclusions_latlon=None):
+    """The grid sweep's rows for a polygon, in its own rotated frame -- shared
+    by grid_photo_points and the pass-count estimate so neither re-derives the
+    projection/rotation setup independently."""
     ref_lat = sum(p[0] for p in polygon_latlon) / len(polygon_latlon)
     ref_lon = sum(p[1] for p in polygon_latlon) / len(polygon_latlon)
     pts_xy = [to_xy(p[0], p[1], ref_lat, ref_lon) for p in polygon_latlon]
@@ -592,7 +991,27 @@ def grid_photo_points(polygon_latlon, cfg, exclusions_latlon=None):
     rpts = [(x * cf - y * sf, x * sf + y * cf) for x, y in pts_xy]
     exclude_rpolys = _project_exclusions(exclusions_latlon, ref_lat, ref_lon, cf, sf)
     margin = side_spacing / 2.0
-    pts = _sweep_coverage(rpts, side_spacing, forward_spacing, exclude_rpolys, margin)
+    rows = _sweep_coverage_rows(rpts, side_spacing, forward_spacing, exclude_rpolys, margin)
+    return rows, rpts, exclude_rpolys, side_spacing, forward_spacing, margin
+
+def _grid_row_count(polygon_latlon, cfg, exclusions_latlon=None):
+    if len(polygon_latlon) < 3:
+        return 0
+    rows, _, _, _, _, _ = _grid_rows_for(polygon_latlon, cfg, exclusions_latlon)
+    return len(rows)
+
+def grid_photo_points(polygon_latlon, cfg, exclusions_latlon=None):
+    """Dense per-photo sample points for a grid area -- the same geometry
+    generate_grid uses to lay out its sparse row-turn flight path, flattened
+    here for counting/estimating instead. Used for the photo-count estimate
+    and for excluded_count (how many shots a no-fly zone would actually
+    remove), since generate_grid's own output is no longer one entry per
+    photo -- see its comment for why."""
+    if len(polygon_latlon) < 3:
+        return []
+    rows, rpts, exclude_rpolys, side_spacing, forward_spacing, margin = _grid_rows_for(
+        polygon_latlon, cfg, exclusions_latlon)
+    pts = [pt for row in rows for seg in row for pt in seg]
     if cfg.get('crosshatch'):
         transposed = [(y, x) for x, y in rpts]
         transposed_excl = [[(y, x) for x, y in poly] for poly in exclude_rpolys]
@@ -614,14 +1033,9 @@ def generate_grid(polygon_latlon, cfg, exclusions_latlon=None):
     rpts = [(x * cf - y * sf, x * sf + y * cf) for x, y in pts_xy]
     exclude_rpolys = _project_exclusions(exclusions_latlon, ref_lat, ref_lon, cf, sf)
 
-    # Sample points just past the true boundary still count as covered, up to
-    # half a row's spacing out. The boundary is where the surveyed site ends,
-    # not a fence the flight path must stay strictly inside of -- a photo
-    # taken a little past the edge is free extra coverage, not a defect, and
-    # treating the edge as hard-strict is exactly what produced short/ragged
-    # rows near a polygon's corners (confirmed by direct test against a true
-    # rectangle: even a sweep rotation that exactly matches the shape's own
-    # tilt still tapers at the tips without this margin).
+    # The boundary marks where the site ends, not a fence: coverage may reach
+    # half a row's spacing past it, which is free extra coverage. Treating the
+    # edge as strict is what produced short, ragged rows near the corners.
     margin = side_spacing / 2.0
     rows = _sweep_coverage_rows(rpts, side_spacing, forward_spacing, exclude_rpolys, margin)
     if cfg.get('crosshatch'):
@@ -631,58 +1045,62 @@ def generate_grid(polygon_latlon, cfg, exclusions_latlon=None):
         transposed = [(y, x) for x, y in rpts]
         transposed_excl = [[(y, x) for x, y in poly] for poly in exclude_rpolys]
         rows2 = _sweep_coverage_rows(transposed, side_spacing, forward_spacing, transposed_excl, margin)
-        rows += [[(x, y) for y, x in row] for row in rows2]
+        rows += [[[(x, y) for y, x in seg] for seg in row] for row in rows2]
 
     if not rows:
         raise ValueError('No coverage generated — the area may be too small for the current spacing/altitude')
 
-    # Two waypoint modes, mirroring what YMapper and Waypoint OS both settled
-    # on (checked their actual output/source rather than guessing): "Full"
-    # puts a real navigational stop at every photo, which is simple and needs
-    # no manual pre-flight step, but real flight testing confirmed it causes
-    # position-hold jitter and RC2 mission-count instability on a dense grid
-    # -- see the "turnOnly" branch's comment for the alternative and why it's
-    # the default. Both are legitimate choices depending on area size and
-    # whether you're willing to do the manual camera-interval step.
+    # Two waypoint modes, matching what YMapper and Waypoint OS both settled on.
+    # "Full" stops at every photo: no manual pre-flight step, but jitter-prone
+    # on a dense grid. "turnOnly" is the default -- see its branch below.
+    # Both route the finished path around no-fly zones: splitting rows at a zone
+    # boundary keeps photos out of it but says nothing about the legs BETWEEN
+    # stretches, which is where the aircraft actually crossed. See
+    # _route_around_exclusions.
+    detour_margin = max(2.0, forward_spacing * 0.25)
+
     if cfg.get('waypointMode') == 'full':
+        ordered = [pt for cell in _decompose_into_cells(rows) for seg in cell for pt in seg]
         waypoints = []
-        for row in rows:
-            for x, y in row:
-                lx, ly = x * ci - y * si, x * si + y * ci
-                lat, lon = from_xy(lx, ly, ref_lat, ref_lon)
-                waypoints.append({'lat': lat, 'lon': lon, 'alt': cfg['altitude'], 'speed': cfg['speed'],
-                                   'gimbal': cfg.get('gimbalPitch', -90), 'heading_mode': 'followWayline',
-                                   'photo': True, 'hover': cfg.get('delayAtWaypoint', 0)})
+        for x, y, is_detour in _route_around_exclusions(ordered, exclude_rpolys, detour_margin):
+            lx, ly = x * ci - y * si, x * si + y * ci
+            lat, lon = from_xy(lx, ly, ref_lat, ref_lon)
+            waypoints.append({'lat': lat, 'lon': lon, 'alt': cfg['altitude'], 'speed': cfg['speed'],
+                               'gimbal': cfg.get('gimbalPitch', -90), 'heading_mode': 'followWayline',
+                               # A detour point sits outside the surveyed area
+                               # by construction, so it transits rather than
+                               # shooting -- and doesn't pause either.
+                               'photo': not is_detour,
+                               'hover': 0 if is_detour else cfg.get('delayAtWaypoint', 0)})
         return waypoints
 
-    # "Turn only" (default): real per-photo waypoints (one navigational stop
-    # per shot) is what caused position-hold jitter and RC2 mission-count
-    # instability in real flight testing -- confirmed as a known failure mode
-    # independent of this app (Litchi forum reports of the RC2's mission UI
-    # destabilizing on mapping missions with many closely-packed points, and
-    # DJI Fly's own consumer waypoint docs only support discrete stop-and-
-    # shoot actions, not a continuous-flight interval trigger). The actual
-    # practice real drone-mapping tools use instead (confirmed independently
-    # by HOT's drone-flightplan, used for production humanitarian mapping):
-    # fly each row as one continuous straight line and let the camera's own
-    # fixed-interval timer (set manually before the flight -- can't be
-    # encoded in the WPML file) fire the shutter throughout. Cruise speed is
-    # derived FROM that fixed interval, not the other way around, so a photo
-    # actually lands every forward_spacing meters. See cameraInterval's
-    # comment in DEFAULT_MISSION_CONFIG.
+    # "Turn only" (default): a stop at every photo caused position-hold jitter
+    # and RC2 mission-count instability in flight testing, and consumer DJI Fly
+    # has no continuous-flight interval trigger to encode. So each row flies as
+    # one continuous line and the camera's own interval timer (set manually
+    # pre-flight) fires the shutter; cruise speed is derived FROM that interval
+    # so photos land every forward_spacing metres. Same approach as HOT's
+    # drone-flightplan. See cameraInterval in DEFAULT_MISSION_CONFIG.
     camera_interval = cfg.get('cameraInterval') or 2.0
     row_speed = max(0.5, forward_spacing / camera_interval)
 
+    # Segment boundaries come from exact interval arithmetic, so a zone of any
+    # width splits the row properly. Grouping them into connected cells makes
+    # the aircraft finish one side of a zone before starting the other.
+    ordered = []
+    for cell in _decompose_into_cells(rows):
+        for seg in cell:
+            # A grid row is straight, so this yields the same two endpoints it
+            # always did -- shared with the corridor so both mission types
+            # follow one rule for what counts as a turn.
+            ordered.extend(_turn_points(seg))
     waypoints = []
-    for row in rows:
-        for seg in _split_row_gaps(row, forward_spacing):
-            endpoints = [seg[0]] if len(seg) < 2 else [seg[0], seg[-1]]
-            for x, y in endpoints:
-                lx, ly = x * ci - y * si, x * si + y * ci
-                lat, lon = from_xy(lx, ly, ref_lat, ref_lon)
-                waypoints.append({'lat': lat, 'lon': lon, 'alt': cfg['altitude'], 'speed': row_speed,
-                                   'gimbal': cfg.get('gimbalPitch', -90), 'heading_mode': 'followWayline',
-                                   'photo': False, 'hover': 0})
+    for x, y, _is_detour in _route_around_exclusions(ordered, exclude_rpolys, detour_margin):
+        lx, ly = x * ci - y * si, x * si + y * ci
+        lat, lon = from_xy(lx, ly, ref_lat, ref_lon)
+        waypoints.append({'lat': lat, 'lon': lon, 'alt': cfg['altitude'], 'speed': row_speed,
+                           'gimbal': cfg.get('gimbalPitch', -90), 'heading_mode': 'followWayline',
+                           'photo': False, 'hover': 0})
     return waypoints
 
 def generate_3d_mapping(polygon_latlon, cfg, exclusions_latlon=None):
@@ -717,12 +1135,14 @@ def mission_photo_points(polygon_latlon, cfg, exclusions_latlon=None):
             + grid_photo_points(polygon_latlon, oblique_cfg, exclusions_latlon))
 
 def corridor_photo_points(line_latlon, cfg, exclusions_latlon=None):
-    """Dense per-photo sample points for every pass of a corridor, plus the
-    bits generate_corridor needs to turn them into a sparse flight path
-    (ref point, forward spacing). Split out so the photo-count estimate and
-    excluded_count can share this with generate_corridor instead of
-    duplicating the sampling math -- see grid_photo_points for the grid
-    equivalent."""
+    """Per-photo sample points for a corridor, as a list of PASSES, each a
+    list of flyable SEGMENTS -- the same shape _sweep_coverage_rows returns
+    for a grid, so both mission types are consumed the same way.
+
+    Each pass is a properly offset copy of the route polyline (see
+    _polyline_offset for why per-sample perpendiculars were wrong), extended
+    past both ends, then sampled at the photo spacing.
+    """
     if len(line_latlon) < 2:
         return [], (0, 0), 1.0
     ref_lat, ref_lon = line_latlon[0][0], line_latlon[0][1]
@@ -732,90 +1152,91 @@ def corridor_photo_points(line_latlon, cfg, exclusions_latlon=None):
     # into the same plain local-xy frame the route itself uses.
     exclude_xypolys = _project_exclusions(exclusions_latlon, ref_lat, ref_lon, 1.0, 0.0)
 
-    side_spacing, forward_spacing = coverage_spacing(cfg)
-
-    width = max(0.0, cfg.get('corridorWidth', 0))
-    n_passes = 1 if width <= 0 else max(1, math.ceil(width / side_spacing) + 1)
-    half = width / 2
-    offsets = [0.0] if n_passes == 1 else [-half + i * (width / (n_passes - 1)) for i in range(n_passes)]
-
-    seglens = []
-    total_len = 0.0
-    for i in range(len(pts_xy) - 1):
-        dx = pts_xy[i + 1][0] - pts_xy[i][0]
-        dy = pts_xy[i + 1][1] - pts_xy[i][1]
-        l = math.hypot(dx, dy)
-        seglens.append(l)
-        total_len += l
-    if total_len <= 0:
+    if _polyline_length(pts_xy) <= 0:
         raise ValueError('Route has zero length')
 
-    n_samples = max(2, int(total_len // forward_spacing) + 1)
-    samples = []
-    dist_accum = 0.0
-    seg_i = 0
-    for s in range(n_samples + 1):
-        target = total_len * s / n_samples
-        while seg_i < len(seglens) - 1 and dist_accum + seglens[seg_i] < target:
-            dist_accum += seglens[seg_i]
-            seg_i += 1
-        seg_len = seglens[seg_i] if seglens[seg_i] > 0 else 1e-9
-        t = min(max((target - dist_accum) / seg_len, 0), 1)
-        x1, y1 = pts_xy[seg_i]
-        x2, y2 = pts_xy[seg_i + 1]
-        x, y = x1 + (x2 - x1) * t, y1 + (y2 - y1) * t
-        heading = math.atan2(x2 - x1, y2 - y1)
-        samples.append((x, y, heading))
+    side_spacing, forward_spacing = coverage_spacing(cfg)
+    width = max(0.0, cfg.get('corridorWidth', 0))
+
+    # Same margin philosophy as the grid: the corridor width marks where the
+    # surveyed strip ends, not a fence the aircraft must stay inside of.
+    # Covering slightly past it is free extra coverage, whereas putting the
+    # outermost pass exactly on the edge leaves that edge with only half a
+    # photo footprint over it.
+    margin = side_spacing / 2.0
+    half = width / 2.0 + margin
+    span = 2.0 * half
+    n_passes = 1 if width <= 0 else max(2, math.ceil(span / side_spacing) + 1)
+    offsets = [0.0] if n_passes == 1 else [-half + i * (span / (n_passes - 1))
+                                           for i in range(n_passes)]
 
     passes = []
     for pass_i, off in enumerate(offsets):
-        pass_samples = samples if pass_i % 2 == 0 else list(reversed(samples))
-        pass_xy = []
-        for x, y, heading in pass_samples:
-            perp = heading + math.pi / 2
-            ox, oy = x + off * math.sin(perp), y + off * math.cos(perp)
-            if _in_any_polygon(ox, oy, exclude_xypolys):
-                continue
-            pass_xy.append((ox, oy))
-        passes.append(pass_xy)
+        line = _polyline_extend(_polyline_offset(pts_xy, off), margin)
+        samples = _polyline_samples(line, forward_spacing)
+        if pass_i % 2 == 1:
+            samples.reverse()
+        # Split at the exclusion zones directly rather than dropping points
+        # and inferring the gap from spacing afterwards -- that heuristic
+        # missed any zone narrower than 1.5x the photo spacing and let a leg
+        # fly straight through it.
+        segs, cur = [], []
+        for pt in samples:
+            if _in_any_polygon(pt[0], pt[1], exclude_xypolys):
+                if cur:
+                    segs.append(cur)
+                    cur = []
+            else:
+                cur.append(pt)
+        if cur:
+            segs.append(cur)
+        if segs:
+            passes.append(segs)
     return passes, (ref_lat, ref_lon), forward_spacing
 
 def generate_corridor(line_latlon, cfg, exclusions_latlon=None):
-    passes, (ref_lat, ref_lon), forward_spacing = corridor_photo_points(line_latlon, cfg, exclusions_latlon)
     if len(line_latlon) < 2:
         raise ValueError('A corridor route needs at least 2 points')
+    passes, (ref_lat, ref_lon), forward_spacing = corridor_photo_points(
+        line_latlon, cfg, exclusions_latlon)
     if not any(passes):
-        raise ValueError('No coverage generated — the route may be too short, or fully inside a no-fly zone')
+        raise ValueError('No coverage generated - the route may be too short, or fully inside a no-fly zone')
+
+    # Corridors get the same no-fly-zone routing as grids: splitting a pass at
+    # the zone boundary keeps photos out of it, but says nothing about the
+    # straight leg between one stretch and the next, which is where the
+    # aircraft actually crossed one. See _route_around_exclusions.
+    exclude_xypolys = _project_exclusions(exclusions_latlon, ref_lat, ref_lon, 1.0, 0.0)
+    detour_margin = max(2.0, forward_spacing * 0.25)
 
     # Same Full/Turn Only choice as generate_grid -- see its comment.
     if cfg.get('waypointMode') == 'full':
+        ordered = [pt for pas in passes for seg in pas for pt in seg]
         waypoints = []
-        for pass_xy in passes:
-            for ox, oy in pass_xy:
-                lat, lon = from_xy(ox, oy, ref_lat, ref_lon)
-                waypoints.append({'lat': lat, 'lon': lon, 'alt': cfg['altitude'], 'speed': cfg['speed'],
-                                   'gimbal': cfg.get('gimbalPitch', -90), 'heading_mode': 'followWayline',
-                                   'photo': True, 'hover': cfg.get('delayAtWaypoint', 0)})
+        for ox, oy, is_detour in _route_around_exclusions(ordered, exclude_xypolys, detour_margin):
+            lat, lon = from_xy(ox, oy, ref_lat, ref_lon)
+            waypoints.append({'lat': lat, 'lon': lon, 'alt': cfg['altitude'], 'speed': cfg['speed'],
+                               'gimbal': cfg.get('gimbalPitch', -90), 'heading_mode': 'followWayline',
+                               'photo': not is_detour,
+                               'hover': 0 if is_detour else cfg.get('delayAtWaypoint', 0)})
         return waypoints
 
-    # Same reasoning as generate_grid: a real per-photo waypoint every
-    # forward_spacing meters is what caused position-hold jitter and RC2
-    # mission-count instability in practice. Each pass flies as one
-    # continuous line at a speed derived from the camera's own fixed
-    # interval-shooting timer instead. See generate_grid's comment and
-    # cameraInterval's comment in DEFAULT_MISSION_CONFIG.
+    # Same reasoning as generate_grid: each pass flies as one continuous line
+    # at a speed derived from the camera's interval timer, rather than stopping
+    # per photo. See cameraInterval in DEFAULT_MISSION_CONFIG.
     camera_interval = cfg.get('cameraInterval') or 2.0
     row_speed = max(0.5, forward_spacing / camera_interval)
 
+    ordered = []
+    for pas in passes:
+        for seg in pas:
+            ordered.extend(_turn_points(seg))
     waypoints = []
-    for pass_xy in passes:
-        for seg in _split_row_gaps(pass_xy, forward_spacing):
-            endpoints = [seg[0]] if len(seg) < 2 else [seg[0], seg[-1]]
-            for ox, oy in endpoints:
-                lat, lon = from_xy(ox, oy, ref_lat, ref_lon)
-                waypoints.append({'lat': lat, 'lon': lon, 'alt': cfg['altitude'], 'speed': row_speed,
-                                   'gimbal': cfg.get('gimbalPitch', -90), 'heading_mode': 'followWayline',
-                                   'photo': False, 'hover': 0})
+    for ox, oy, _is_detour in _route_around_exclusions(ordered, exclude_xypolys, detour_margin):
+        lat, lon = from_xy(ox, oy, ref_lat, ref_lon)
+        waypoints.append({'lat': lat, 'lon': lon, 'alt': cfg['altitude'], 'speed': row_speed,
+                           'gimbal': cfg.get('gimbalPitch', -90), 'heading_mode': 'followWayline',
+                           'photo': False, 'hover': 0})
     return waypoints
 
 def generate_orbit(center_lat, center_lon, cfg):
@@ -845,8 +1266,12 @@ def generate_orbit(center_lat, center_lon, cfg):
             hdg = bearing_deg(lat, lon, center_lat, center_lon)
             hdg = hdg - 360 if hdg > 180 else hdg
             pitch = -math.degrees(math.atan2(altitude, radius))
+            # Per DJI's WPML spec 'fixed' means "hold the current heading",
+            # NOT "point at this angle" -- 'smoothTransition' is the mode that
+            # actually reads waypointHeadingAngle, which is what facing the
+            # orbit centre needs.
             waypoints.append({'lat': lat, 'lon': lon, 'alt': altitude, 'speed': cfg.get('speed', 5),
-                               'gimbal': round(pitch), 'heading_mode': 'fixed', 'heading_angle': round(hdg),
+                               'gimbal': round(pitch), 'heading_mode': 'smoothTransition', 'heading_angle': round(hdg),
                                'photo': cfg.get('photo', True), 'hover': cfg.get('delayAtWaypoint', 0),
                                # A circular path made of stop-and-rotate segments (the grid/corridor
                                # default) looks like a stuttering polygon, not an orbit — DJI Fly's
@@ -893,7 +1318,11 @@ def estimate_coverage(polygon_latlon, cfg):
                 'area_m2': 0, 'shutter_speed': None, 'forward_interval_s': 0}
     side_spacing, forward_spacing = coverage_spacing(cfg)
     pts = grid_photo_points(polygon_latlon, cfg)
-    passes = max(1, round(polygon_area_m2(polygon_latlon) ** 0.5 / side_spacing))
+    # Pass count comes from the real sweep, not sqrt(area)/spacing -- that
+    # approximation assumes a square footprint and ignores rotation entirely,
+    # so it was well off for long/thin or rotated areas (exactly the shapes
+    # where knowing the pass count matters most).
+    passes = max(1, _grid_row_count(polygon_latlon, cfg))
     shutter = recommended_shutter_speed(cfg['altitude'], cfg['sensor_w'], cfg['focal'], cfg['img_w'], cfg['speed'])
     interval = forward_spacing / cfg['speed'] if cfg.get('speed') else 0
     return {'side_spacing': round(side_spacing, 1), 'forward_spacing': round(forward_spacing, 1),
@@ -1157,6 +1586,10 @@ def build_waylines_wpml(cfg, waypoints):
         ag = _action_group_xml(wp2, i)
         heading_mode = wp.get('heading_mode', cfg['headingMode'])
         heading_angle = wp.get('heading_angle', 0)
+        # Absent from DJI's documented WPML spec and from real production
+        # files, so likely inert -- but an independent WPML library pairs
+        # smoothTransition with 1, and matching that costs nothing.
+        heading_angle_enable = 1 if heading_mode in ('smoothTransition', 'towardPOI') else 0
         placemarks.append(f'''
       <Placemark>
         <Point>
@@ -1169,7 +1602,7 @@ def build_waylines_wpml(cfg, waypoints):
           <wpml:waypointHeadingMode>{heading_mode}</wpml:waypointHeadingMode>
           <wpml:waypointHeadingAngle>{heading_angle}</wpml:waypointHeadingAngle>
           <wpml:waypointPoiPoint>0.000000,0.000000,0.000000</wpml:waypointPoiPoint>
-          <wpml:waypointHeadingAngleEnable>0</wpml:waypointHeadingAngleEnable>
+          <wpml:waypointHeadingAngleEnable>{heading_angle_enable}</wpml:waypointHeadingAngleEnable>
           <wpml:waypointHeadingPathMode>followBadArc</wpml:waypointHeadingPathMode>
         </wpml:waypointHeadingParam>
         <wpml:waypointTurnParam>
@@ -1201,21 +1634,14 @@ def export_wpml_kmz(cfg, waypoints, out_path):
         z.writestr('wpmz/waylines.wpml', wpml)
 
 # ── Upload straight to a DJI RC over MTP ─────────────────────────────────────
-# ADB is not a real option on the RC2: independent reverse-engineering (see
-# docs.f1y.ing's RC2 research notes) confirms adbd is present but deliberately
-# refuses host handshakes as a firmware hardening measure — that's why it shows
-# "offline" forever, not "unauthorized" or missing. No driver/cable/settings fix
-# changes that. MTP is what DJI actually supports, so that's what this drives,
-# via the same Shell.Application COM automation Windows Explorer itself uses to
-# browse MTP devices — no extra driver or library needed beyond pywin32.
+# ADB can't work here: the RC2's adbd deliberately refuses host handshakes as a
+# firmware hardening measure, so it reports "offline" forever. MTP is what DJI
+# supports, driven via the Shell.Application COM automation Explorer itself uses.
 #
-# DJI Fly only ever loads a mission it created itself, so the trick (same one
-# DJI-KMZ-Injector's own ADB backend uses) is: a dummy mission already exists on
-# the controller as a UUID-named folder containing "<uuid>.kmz". Rather than
-# guessing which one to overwrite, list_mission_slots() surfaces all of them —
-# with waypoint count and approximate location read from each mission file, since
-# DJI Fly's own mission title isn't stored anywhere MTP can reach — and the user
-# picks which slot upload_kmz_to_slot() replaces.
+# DJI Fly only loads missions it created, so a dummy mission must already exist
+# on the controller as a UUID folder holding "<uuid>.kmz". list_mission_slots()
+# lists them with waypoint count and location (DJI Fly's own mission title isn't
+# reachable over MTP) so the user picks which one to replace.
 
 WAYPOINT_MTP_PATH = ['Internal shared storage', 'Android', 'data', 'dji.go.v5', 'files', 'waypoint']
 _UUID_RE = re.compile(r'^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$')
@@ -1489,7 +1915,21 @@ class Api:
 
     def get_presets(self):
         return {'drones': DRONE_PRESETS, 'cameras': CAMERA_PRESETS, 'gimbals': GIMBAL_PRESETS,
-                'defaults': DEFAULT_MISSION_CONFIG}
+                'defaults': DEFAULT_MISSION_CONFIG, 'version': APP_VERSION}
+
+    # ── App settings (tiny JSON file in the user's home dir) ──
+    # Browser-side storage can't be trusted for anything that must survive
+    # restarts here: the page's origin includes the local server's port, and
+    # an origin change silently wipes localStorage. Used for the remembered
+    # drone model and the first-run tutorial flag.
+    def get_app_settings(self):
+        return {'ok': True, 'settings': _load_app_settings()}
+
+    def set_app_setting(self, key, value):
+        s = _load_app_settings()
+        s[str(key)] = value
+        _save_app_settings(s)
+        return {'ok': True}
 
     # ── Import ──
     def import_kml(self):
@@ -1531,10 +1971,10 @@ class Api:
     def generate_corridor(self, line, cfg, exclusions=None):
         try:
             wps = generate_corridor(line, cfg, exclusions)
-            photos = sum(len(p) for p in corridor_photo_points(line, cfg, exclusions)[0])
+            photos = sum(len(s) for p in corridor_photo_points(line, cfg, exclusions)[0] for s in p)
             excluded = 0
             if exclusions:
-                excluded_photos = sum(len(p) for p in corridor_photo_points(line, cfg, None)[0])
+                excluded_photos = sum(len(s) for p in corridor_photo_points(line, cfg, None)[0] for s in p)
                 excluded = max(0, excluded_photos - photos)
             return {'ok': True, 'waypoints': wps, 'excluded_count': excluded, 'estimated_photos': photos}
         except Exception as e:
@@ -1666,20 +2106,14 @@ class Api:
             return {'ok': False, 'msg': str(e)}
 
     def export_gcps(self, gcps, filename=None):
-        # A plain CSV, not a flight waypoint file -- GCPs are reference markers
-        # for correcting the orthomosaic afterward in Pix4D/Metashape/WebODM.
-        # Elevation is a real, required field for all three (georeferencing
-        # needs X/Y/Z, not just X/Y -- vertical accuracy matters), which is why
-        # it's here even though nothing else in this app tracks GCP elevation.
-        # Column ORDER (X-first vs Y-first) varies by tool -- Pix4D wants
-        # label,Easting,Northing,z while WebODM wants label,Northing,Easting,
-        # Elevation -- so every real importer has you map columns on import
-        # rather than assume a fixed order; Label/Latitude/Longitude/Elevation
-        # here is the readable default, not a promise it matches any one
-        # tool's exact expected order. Surveyed/Notes are trailing metadata
-        # for your own reference, not something the photogrammetry tools need.
-        # They're never written into the WPML export, since DJI Fly would try
-        # to fly to them.
+        # Reference markers for correcting the orthomosaic in
+        # Pix4D/Metashape/WebODM, not flight waypoints (they're never written
+        # into the WPML export -- DJI Fly would try to fly to them).
+        # Elevation is required by all three: georeferencing needs X/Y/Z.
+        # Column order varies by tool (Pix4D wants Easting first, WebODM
+        # Northing first) and every importer has you map columns anyway, so
+        # this order is just the readable default. Surveyed/Notes are for
+        # your own reference.
         if not gcps:
             return {'ok': False, 'msg': 'No ground control points to export'}
         fname = _safe_filename(filename) or 'gcps.csv'
@@ -1829,7 +2263,8 @@ body{font-family:'Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(
   box-shadow:0 1px 0 #000, 0 2px 6px #0006;flex-shrink:0;}
 #titlebar .logo{color:var(--orange);font-size:15px;font-weight:700;letter-spacing:.3px;
   display:flex;align-items:center;gap:7px;}
-#titlebar .sub{color:var(--text-faint);font-size:10px;margin-top:2px;letter-spacing:.2px;}
+#titlebar .logo #app-version{font-size:10px;color:var(--text-faint);font-weight:600;
+  letter-spacing:.4px;margin-left:2px;}
 #titlebar .credit{margin-left:auto;font-size:10px;color:var(--text-faint);}
 #titlebar .credit a{color:var(--orange-dim);text-decoration:none;}
 #titlebar .credit a:hover{color:var(--orange);}
@@ -1863,6 +2298,9 @@ button:disabled{opacity:.35;cursor:default;}
   font-weight:600;transition:color .12s;}
 .tab:hover{color:var(--text-dim);}
 .tab.active{color:var(--orange);border-bottom-color:var(--orange);background:var(--orange-glow);}
+.tab-badge{display:inline-block;margin-left:5px;background:var(--orange);color:#000;
+  border-radius:8px;padding:0 5px;font-size:8.5px;font-weight:800;letter-spacing:0;vertical-align:1px;}
+.tab-badge:empty{display:none;}
 #tab-content{flex:1;overflow-y:auto;padding:12px;}
 
 /* ── Section cards ── */
@@ -1916,9 +2354,14 @@ details .details-body{padding:2px 10px 10px;}
   border-radius:8px;text-transform:uppercase;letter-spacing:.5px;margin-left:6px;}
 
 .mission-type-grid{display:grid;grid-template-columns:1fr 1fr;gap:7px;}
-.mission-type-grid button{padding:12px 4px;text-align:center;font-size:12px;line-height:1.7;
-  background:var(--bg3);border-color:var(--border2);}
-.mission-type-grid button:hover{background:var(--bg4);border-color:var(--orange-dim);}
+.mission-type-btn{display:flex;flex-direction:column;align-items:center;gap:6px;
+  padding:11px 4px 9px;font-size:11.5px;background:var(--bg3);border-color:var(--border2);
+  color:var(--text-dim);}
+.mission-type-btn svg{width:26px;height:26px;color:var(--text-faint);transition:color .12s;}
+.mission-type-btn:hover{background:var(--bg4);border-color:var(--orange-dim);color:var(--text);}
+.mission-type-btn:hover svg{color:var(--orange);}
+.mission-type-btn.active{background:var(--orange);border-color:var(--orange2);color:#000;font-weight:700;}
+.mission-type-btn.active svg{color:#000;}
 
 /* ── Waypoints table ── */
 #wp-table{width:100%;border-collapse:collapse;font-size:11px;}
@@ -1974,7 +2417,8 @@ details .details-body{padding:2px 10px 10px;}
 #draw-hint{position:absolute;top:12px;left:calc(258px + (100% - 258px)/2);
   transform:translateX(-50%);z-index:900;
   background:#0a0a0ae8;border:1px solid var(--orange);border-radius:var(--radius);padding:8px 18px;
-  font-size:12px;color:#fff;display:none;pointer-events:none;box-shadow:0 4px 16px #000a;}
+  font-size:12px;color:#fff;display:none;pointer-events:none;box-shadow:0 4px 16px #000a;
+  max-width:min(600px, calc(100% - 290px));text-align:center;line-height:1.5;}
 #draw-hint.visible{display:block;}
 #map-search{position:absolute;top:12px;left:12px;z-index:900;display:flex;gap:6px;}
 #map-search input{width:230px;background:#0a0a0ae8;border:1px solid var(--border2);color:var(--text);
@@ -2040,16 +2484,109 @@ details .details-body{padding:2px 10px 10px;}
 ::-webkit-scrollbar-track{background:transparent;}
 ::-webkit-scrollbar-thumb{background:var(--border2);border-radius:4px;}
 ::-webkit-scrollbar-thumb:hover{background:var(--orange-dim);}
+
+/* Keyboard-visible focus for accessibility -- mouse clicks don't show it,
+   tabbing does. */
+button:focus-visible,input:focus-visible,select:focus-visible,.tab:focus-visible{
+  outline:2px solid var(--orange2);outline-offset:1px;}
+
+/* ── Splashscreen ── */
+#splash{position:fixed;inset:0;z-index:10000;background:var(--bg);
+  display:flex;flex-direction:column;align-items:center;justify-content:center;gap:0;
+  transition:opacity .45s ease;}
+#splash.fading{opacity:0;pointer-events:none;}
+#splash-art{position:relative;width:150px;height:150px;display:flex;
+  align-items:center;justify-content:center;margin-bottom:18px;}
+#splash-art .ring{position:absolute;inset:0;border:1.5px solid var(--orange);
+  border-radius:50%;opacity:0;animation:splash-ping 2.1s ease-out infinite;}
+#splash-art .ring:nth-child(2){animation-delay:.7s;}
+#splash-art .ring:nth-child(3){animation-delay:1.4s;}
+@keyframes splash-ping{
+  0%{transform:scale(.35);opacity:0;}
+  12%{opacity:.55;}
+  100%{transform:scale(1.15);opacity:0;}
+}
+#splash-drone{animation:splash-hover 2.6s ease-in-out infinite;filter:drop-shadow(0 6px 14px #000c);}
+@keyframes splash-hover{0%,100%{transform:translateY(0);}50%{transform:translateY(-7px);}}
+#splash-title{font-size:19px;font-weight:700;color:var(--orange);letter-spacing:.6px;}
+#splash-sub{font-size:10.5px;color:var(--text-faint);margin-top:6px;letter-spacing:2.5px;
+  text-transform:uppercase;}
+#splash-bar{width:170px;height:2px;background:var(--bg3);border-radius:2px;margin-top:22px;
+  overflow:hidden;position:relative;}
+#splash-bar::after{content:'';position:absolute;top:0;left:-40%;width:40%;height:100%;
+  background:linear-gradient(90deg,transparent,var(--orange),transparent);
+  animation:splash-shimmer 1.1s linear infinite;}
+@keyframes splash-shimmer{to{left:100%;}}
+
+/* ── Interactive tutorial ── */
+#tour-overlay{position:fixed;inset:0;z-index:9000;display:none;}
+#tour-overlay.visible{display:block;}
+#tour-spotlight{position:fixed;border-radius:9px;z-index:9001;pointer-events:none;
+  box-shadow:0 0 0 200vmax rgba(0,0,0,.74);border:1.5px solid var(--orange);
+  transition:top .3s ease,left .3s ease,width .3s ease,height .3s ease,opacity .3s ease;}
+#tour-spotlight.hidden-target{opacity:0;}
+#tour-card{position:fixed;z-index:9002;width:340px;max-width:calc(100vw - 24px);background:var(--bg2);
+  border:1px solid var(--orange-dim);border-radius:var(--radius);
+  box-shadow:0 12px 44px #000d;transition:top .3s ease,left .3s ease;}
+#tour-card h3{padding:12px 15px 0;font-size:13px;color:var(--orange);font-weight:700;}
+#tour-card .tour-body{padding:8px 15px 12px;font-size:11.8px;line-height:1.65;color:var(--text);}
+#tour-card .tour-body b{color:var(--orange2);}
+/* A dot per step overflowed the card once the tour grew past a handful of
+   steps -- 14 dots plus three buttons simply don't fit, and the Next button
+   was pushed outside the card's right edge. A compact "3 / 14" counter takes
+   fixed space no matter how many steps there are. min-width:0 + flex-shrink
+   let the buttons compress rather than overflow if the card is ever
+   narrowed. */
+#tour-card .tour-footer{display:flex;align-items:center;gap:6px;padding:10px 15px;
+  border-top:1px solid var(--border);min-width:0;}
+#tour-card .tour-count{margin-right:auto;font-size:10.5px;color:var(--text-faint);
+  font-variant-numeric:tabular-nums;white-space:nowrap;}
+#tour-card .tour-footer button{flex-shrink:1;min-width:0;padding:6px 10px;}
+#tour-card .tour-skip{background:none;border:none;color:var(--text-faint);font-size:11px;
+  padding:4px 6px;flex-shrink:0;}
+#tour-card .tour-skip:hover{color:var(--text);background:none;border:none;}
 </style>
 </head>
 <body>
 
+<div id="splash">
+  <div id="splash-art">
+    <div class="ring"></div><div class="ring"></div><div class="ring"></div>
+    <svg id="splash-drone" width="64" height="64" viewBox="0 0 24 24">
+      <g stroke="#e07b00" stroke-width="1.5" stroke-linecap="round" fill="none">
+        <line x1="12" y1="12" x2="4.5" y2="4.5"/><line x1="12" y1="12" x2="19.5" y2="4.5"/>
+        <line x1="12" y1="12" x2="4.5" y2="19.5"/><line x1="12" y1="12" x2="19.5" y2="19.5"/>
+        <circle cx="4.5" cy="4.5" r="2.6"/><circle cx="19.5" cy="4.5" r="2.6"/>
+        <circle cx="4.5" cy="19.5" r="2.6"/><circle cx="19.5" cy="19.5" r="2.6"/>
+      </g>
+      <circle cx="12" cy="12" r="2.4" fill="#e07b00"/>
+    </svg>
+  </div>
+  <div id="splash-title">Drone Mission Planner</div>
+  <div id="splash-sub">DJI WPML mission builder</div>
+  <div id="splash-bar"></div>
+</div>
+
+<div id="tour-overlay">
+  <div id="tour-spotlight"></div>
+  <div id="tour-card">
+    <h3 id="tour-title"></h3>
+    <div class="tour-body" id="tour-body"></div>
+    <div class="tour-footer">
+      <div class="tour-count" id="tour-count"></div>
+      <button class="tour-skip" onclick="endTour()">Skip ✕</button>
+      <button id="tour-back" onclick="tourStep(-1)">&#8592; Back</button>
+      <button class="primary" id="tour-next" onclick="tourStep(1)">Next &#8594;</button>
+    </div>
+  </div>
+</div>
+
 <div id="titlebar">
   <div>
-    <div class="logo">&#128225; Drone Mission Planner</div>
-    <div class="sub">KML/KMZ import &middot; grid / corridor / orbit / manual missions &middot; DJI WPML export</div>
+    <div class="logo">&#128225; Drone Mission Planner<span id="app-version"></span></div>
   </div>
-  <div class="credit">by <a href="https://github.com/0xpraet0rian" target="_blank">praet0rian (mark0)</a></div>
+  <button id="btn-tour" onclick="startTour()" style="margin-left:auto;font-size:11px;padding:4px 10px;" title="Interactive guided tour of the app">&#127891; Tutorial</button>
+  <div class="credit" style="margin-left:12px;">by <a href="https://github.com/0xpraet0rian" target="_blank">praet0rian (mark0)</a></div>
 </div>
 
 <div id="toolbar">
@@ -2062,15 +2599,20 @@ details .details-body{padding:2px 10px 10px;}
   </div>
   <div class="sep"></div>
   <div class="tgroup">
-    <button onclick="clearMission()">&#128465; Clear</button>
-    <button class="primary" onclick="exportWpml()">&#128190; Export WPML</button>
+    <button id="btn-undo" onclick="undoAction()" disabled title="Undo (Ctrl+Z)">&#8617; Undo</button>
+    <button id="btn-redo" onclick="redoAction()" disabled title="Redo (Ctrl+Y)">&#8618; Redo</button>
+  </div>
+  <div class="sep"></div>
+  <div class="tgroup" id="tgroup-export">
+    <button onclick="clearMission()" title="Clear the current mission's waypoints">&#128465; Clear</button>
+    <button class="primary" onclick="exportWpml()" title="Export the mission as a DJI WPML .kmz ready to fly">&#128190; Export WPML</button>
     <button onclick="exportWpmlSplit()" title="Split into multiple missions sized to your battery's usable endurance">&#128267; Export by Battery</button>
     <button onclick="openUploadPicker()" title="Pick a mission slot on a connected DJI RC/RC2 to replace, over MTP">&#128225; Upload to RC</button>
   </div>
   <div class="sep"></div>
-  <div class="tgroup">
-    <button onclick="saveProject()">Save</button>
-    <button onclick="loadProject()">Load</button>
+  <div class="tgroup" id="tgroup-file">
+    <button onclick="saveProject()" title="Save the whole project (mission, zones, GCPs, settings) to a file">Save</button>
+    <button onclick="loadProject()" title="Load a saved project file">Load</button>
   </div>
   <div id="status-bar">Ready</div>
 </div>
@@ -2095,11 +2637,25 @@ details .details-body{padding:2px 10px 10px;}
   </div>
 </div>
 
+<div id="tour-welcome-overlay" class="modal-overlay">
+  <div class="modal-panel" style="width:430px;">
+    <h3>&#128075; Welcome</h3>
+    <div style="padding:14px 16px;font-size:12.5px;line-height:1.7;color:var(--text);">
+      First time here? Take a quick <b>interactive tour</b> — it walks through drawing a mission,
+      the parameters that matter, and getting the flight onto your controller. About two minutes.
+    </div>
+    <div style="display:flex;gap:8px;padding:0 16px 14px;">
+      <button class="primary" style="flex:1;" onclick="closeTourWelcome(true)">&#127891; Start the tour</button>
+      <button onclick="closeTourWelcome(false)">Maybe later</button>
+    </div>
+  </div>
+</div>
+
 <div id="main">
   <div id="sidebar">
     <div id="tabs">
       <div class="tab active" data-tab="setup" onclick="showTab('setup')">Setup</div>
-      <div class="tab" data-tab="waypoints" onclick="showTab('waypoints')">Waypoints</div>
+      <div class="tab" data-tab="waypoints" onclick="showTab('waypoints')">Waypoints<span id="tab-wp-count" class="tab-badge"></span></div>
       <div class="tab" data-tab="layers" onclick="showTab('layers')">Layers</div>
     </div>
     <div id="tab-content"></div>
@@ -2140,6 +2696,66 @@ var lastEstimatedPhotos = 0;
 var exclusionZones = []; // [{coords:[[lat,lon],...]}] — no-fly holes a grid mission skips
 var gcpPoints = [];       // [{lat,lon,label}] — ground control points, exported separately, never flown to
 
+// ── Undo / redo ──────────────────────────────────────────────────────────
+// Whole-state JSON snapshots rather than a command log: far safer across this
+// many mutation sites than tracking an inverse for each, at a little memory.
+var HISTORY_LIMIT = 50;
+var historyUndo = [];
+var historyRedo = [];
+function snapshotState(){
+  return JSON.stringify({pendingKind:pendingKind, pendingGeom:pendingGeom, pendingGenerated:pendingGenerated,
+    waypoints:waypoints, exclusionZones:exclusionZones, gcpPoints:gcpPoints, importedLayers:importedLayers,
+    missionName:missionName});
+}
+// Call BEFORE a mutation, capturing the about-to-be-old state onto the undo
+// stack -- any new change invalidates whatever was in the redo stack.
+function pushHistory(){
+  historyUndo.push(snapshotState());
+  if(historyUndo.length>HISTORY_LIMIT) historyUndo.shift();
+  historyRedo = [];
+  updateUndoRedoButtons();
+}
+function restoreSnapshot(snap){
+  var s = JSON.parse(snap);
+  pendingKind=s.pendingKind; pendingGeom=s.pendingGeom; pendingGenerated=s.pendingGenerated;
+  waypoints=s.waypoints; exclusionZones=s.exclusionZones; gcpPoints=s.gcpPoints;
+  importedLayers=s.importedLayers; missionName=s.missionName;
+  redrawPendingBoundary(); redrawExclusionZones(); redrawGCPs(); drawImportedLayers(false);
+  renderWaypoints();
+  if(activeTab==='setup') renderSetup();
+  else if(activeTab==='waypoints') renderWaypointsTab();
+  else if(activeTab==='layers') renderLayersTab();
+  updateImportButton();
+  refreshEstimate();
+}
+function undoAction(){
+  if(!historyUndo.length) return;
+  historyRedo.push(snapshotState());
+  restoreSnapshot(historyUndo.pop());
+  updateUndoRedoButtons();
+}
+function redoAction(){
+  if(!historyRedo.length) return;
+  historyUndo.push(snapshotState());
+  restoreSnapshot(historyRedo.pop());
+  updateUndoRedoButtons();
+}
+function updateUndoRedoButtons(){
+  var u=document.getElementById('btn-undo'), r=document.getElementById('btn-redo');
+  if(u) u.disabled = historyUndo.length===0;
+  if(r) r.disabled = historyRedo.length===0;
+}
+document.addEventListener('keydown', function(e){
+  if(!(e.ctrlKey || e.metaKey)) return;
+  var tag = document.activeElement ? document.activeElement.tagName : '';
+  // Don't hijack Ctrl+Z/Y while typing in a text field -- the browser's own
+  // native input undo should keep working there instead.
+  if(tag==='INPUT' || tag==='TEXTAREA' || (document.activeElement && document.activeElement.isContentEditable)) return;
+  var key = e.key.toLowerCase();
+  if(key==='z' && !e.shiftKey){ e.preventDefault(); undoAction(); }
+  else if(key==='y' || (key==='z' && e.shiftKey)){ e.preventDefault(); redoAction(); }
+});
+
 // ── Client-side coverage estimate (mirrors the Python formulas exactly) ────
 // footprint = altitude * sensorSize / focalLength — real sensor/lens physics, same
 // formula YMapper itself uses, not a derived-FOV approximation.
@@ -2173,9 +2789,10 @@ function polygonAreaM2(polygon){
 function toXY(lat,lon,refLat,refLon){
   return [(lon-refLon)*111320*Math.cos(refLat*Math.PI/180), (lat-refLat)*110540];
 }
-// Port of the Python point-in-polygon + sweep (_point_in_polygon/_sweep_coverage)
-// so the live estimate matches the real generator exactly instead of guessing off
-// the bounding box, which badly overcounts for diagonal or thin polygons.
+// Port of the Python sweep geometry so the live estimate matches the real
+// generator exactly instead of guessing off the bounding box, which badly
+// overcounts for diagonal or thin polygons. pointInPolygonJS itself is kept
+// for the exclusion-zone hit test on manual waypoint placement.
 function pointInPolygonJS(x,y,poly){
   var inside=false, n=poly.length;
   for(var i=0,j=n-1;i<n;j=i++){
@@ -2184,63 +2801,115 @@ function pointInPolygonJS(x,y,poly){
   }
   return inside;
 }
-function pointInAnyPolygonJS(x,y,polys){
-  if(!polys || !polys.length) return false;
-  for(var i=0;i<polys.length;i++){ if(pointInPolygonJS(x,y,polys[i])) return true; }
-  return false;
-}
-function distPointToSegmentJS(px,py,ax,ay,bx,by){
-  var dx=bx-ax, dy=by-ay;
-  if(dx===0 && dy===0) return Math.hypot(px-ax, py-ay);
-  var t=Math.max(0,Math.min(1, ((px-ax)*dx+(py-ay)*dy)/(dx*dx+dy*dy)));
-  return Math.hypot(px-(ax+t*dx), py-(ay+t*dy));
-}
-function distPointToPolygonBoundaryJS(x,y,poly){
-  var n=poly.length, best=Infinity;
-  for(var i=0;i<n;i++){
-    var j=(i+1)%n;
-    var d=distPointToSegmentJS(x,y,poly[i][0],poly[i][1],poly[j][0],poly[j][1]);
-    if(d<best) best=d;
-  }
-  return best;
-}
-// Mirrors _near_polygon in the Python backend: a sample just past the true
-// boundary still counts as covered, up to `margin` out -- see that function's
-// comment for why this isn't a bug to "fix" back to strict containment.
-function nearPolygonJS(x,y,poly,margin){
-  if(!margin || margin<=0) return pointInPolygonJS(x,y,poly);
-  return pointInPolygonJS(x,y,poly) || distPointToPolygonBoundaryJS(x,y,poly)<=margin;
-}
 function projectExclusionsJS(exclusions, refLat, refLon, cf, sf){
   return (exclusions||[]).filter(e=>e.length>=3).map(function(e){
     return e.map(p=>toXY(p[0],p[1],refLat,refLon)).map(p=>[p[0]*cf-p[1]*sf, p[0]*sf+p[1]*cf]);
   });
 }
-function sweepCoverageJS(rpts, sideSpacing, forwardSpacing, excludePolys, boundaryMargin){
+// Exact scanline row intervals -- direct mirror of the Python backend's
+// _scanline_intervals/_subtract_intervals, so the live
+// photo-count estimate is computed by the SAME geometry as the real
+// generator rather than a sampled approximation of it. See
+// _sweep_coverage_rows (Python) for the full reasoning.
+function scanlineIntervalsJS(y, poly){
+  var xs=[], n=poly.length;
+  for(var i=0;i<n;i++){
+    var x1=poly[i][0], y1=poly[i][1];
+    var x2=poly[(i+1)%n][0], y2=poly[(i+1)%n][1];
+    if((y1>y)!==(y2>y)) xs.push(x1 + (y-y1)*(x2-x1)/(y2-y1));
+  }
+  xs.sort(function(a,b){return a-b;});
+  var out=[];
+  for(var k=0;k+1<xs.length;k+=2) out.push([xs[k], xs[k+1]]);
+  return out;
+}
+function subtractIntervalsJS(ivs, holes){
+  var out=ivs;
+  holes.forEach(function(h){
+    var nxt=[];
+    out.forEach(function(iv){
+      if(h[1]<=iv[0] || h[0]>=iv[1]){ nxt.push(iv); return; }
+      if(h[0]>iv[0]) nxt.push([iv[0], h[0]]);
+      if(h[1]<iv[1]) nxt.push([h[1], iv[1]]);
+    });
+    out=nxt;
+  });
+  return out;
+}
+// Rows of SEGMENTS, mirroring Python's _sweep_coverage_rows. Segment count
+// matters as well as point count: in Turn Only mode each segment costs two
+// waypoints, so a zone that splits rows pushes the total past "passes x 2".
+// Mirrors _offset_polygon in the Python backend -- a real mitered dilation,
+// not a scale about the centroid. See that function for why.
+function offsetPolygonJS(poly, dist){
+  if(!dist || poly.length<3) return poly.slice();
+  var pts=poly.slice(), n=pts.length, area2=0;
+  for(var i=0;i<n;i++){ var j=(i+1)%n; area2 += pts[i][0]*pts[j][1] - pts[j][0]*pts[i][1]; }
+  if(area2<0) pts.reverse();
+  var normals=[];
+  for(var i=0;i<n;i++){
+    var a=pts[i], b=pts[(i+1)%n];
+    var dx=b[0]-a[0], dy=b[1]-a[1], L=Math.hypot(dx,dy)||1;
+    normals.push([dy/L, -dx/L]);   // outward for CCW winding
+  }
+  var out=[];
+  for(var i=0;i<n;i++){
+    var pv=normals[(i-1+n)%n], nx=normals[i];
+    var mx=pv[0]+nx[0], my=pv[1]+nx[1], ml=Math.hypot(mx,my);
+    if(ml<1e-9){ out.push([pts[i][0]+nx[0]*dist, pts[i][1]+nx[1]*dist]); continue; }
+    mx/=ml; my/=ml;
+    var cosHalf=mx*pv[0]+my*pv[1];
+    var miter=dist/Math.max(0.35, cosHalf);
+    out.push([pts[i][0]+mx*miter, pts[i][1]+my*miter]);
+  }
+  return out;
+}
+function sweepCoverageRowsJS(rpts, sideSpacing, forwardSpacing, excludePolys, boundaryMargin){
   var margin=boundaryMargin||0;
-  var xs=rpts.map(p=>p[0]), ys=rpts.map(p=>p[1]);
-  var minx=Math.min.apply(null,xs)-margin, maxx=Math.max.apply(null,xs)+margin;
-  var miny=Math.min.apply(null,ys)-margin, maxy=Math.max.apply(null,ys)+margin;
-  // Distribute rows evenly across the full span (mirrors _sweep_coverage_rows
-  // in the Python backend) instead of stepping a fixed sideSpacing from miny,
-  // which can leave a whole sideSpacing uncovered at the far edge and reads
-  // as lopsided/off-center coverage.
+  // Dilate first, then sweep rows at swath CENTRES -- matches
+  // _sweep_coverage_rows exactly; see its comments for why neither clamping
+  // nor placing rows on the span's extremes works for a rotated site.
+  var area=margin>0 ? offsetPolygonJS(rpts, margin) : rpts;
+  var ys=area.map(p=>p[1]);
+  var miny=Math.min.apply(null,ys), maxy=Math.max.apply(null,ys);
   var spanY=maxy-miny;
-  var nRows=spanY>0 ? Math.max(1, Math.ceil(spanY/sideSpacing)+1) : 1;
-  var rowSpacing=nRows>1 ? spanY/(nRows-1) : sideSpacing;
-  var pts=[], reverse=false, count=0, maxIter=200000;
-  for(var rowI=0; rowI<nRows && count<maxIter; rowI++){
-    var y=miny+rowI*rowSpacing;
-    var line=[];
-    for(var x=minx; x<=maxx+1e-9 && count<maxIter; x+=forwardSpacing, count++){
-      if(nearPolygonJS(x,y,rpts,margin) && !pointInAnyPolygonJS(x,y,excludePolys)) line.push([x,y]);
+  var nRows=spanY>0 ? Math.max(1, Math.ceil(spanY/sideSpacing)) : 1;
+  var rowSpacing=spanY>0 ? spanY/nRows : sideSpacing;
+  var rows=[], reverse=false;
+  for(var rowI=0; rowI<nRows; rowI++){
+    var y=miny+(rowI+0.5)*rowSpacing;
+    var intervals=scanlineIntervalsJS(y, area);
+    if(excludePolys && excludePolys.length){
+      var holes=[];
+      excludePolys.forEach(function(hp){ holes=holes.concat(scanlineIntervalsJS(y, hp)); });
+      intervals=subtractIntervalsJS(intervals, holes);
     }
-    if(line.length && Math.abs(maxx-line[line.length-1][0])>1e-6 && nearPolygonJS(maxx,y,rpts,margin) && !pointInAnyPolygonJS(maxx,y,excludePolys)) line.push([maxx,y]);
-    if(reverse) line.reverse();
-    pts=pts.concat(line);
+    var segs=[];
+    intervals.forEach(function(iv){
+      var a=iv[0], b=iv[1], length=b-a;
+      if(length<0.5){ segs.push([[(a+b)/2, y]]); return; }
+      var nSteps=Math.max(1, Math.ceil(length/forwardSpacing));
+      var step=length/nSteps, seg=[];
+      for(var k=0;k<=nSteps;k++) seg.push([a+k*step, y]);
+      segs.push(seg);
+    });
+    if(reverse){ segs.reverse(); segs.forEach(function(s){ s.reverse(); }); }
+    if(segs.length) rows.push(segs);
     reverse=!reverse;
   }
+  return rows;
+}
+function sweepCoverageJS(rpts, sideSpacing, forwardSpacing, excludePolys, boundaryMargin){
+  var pts=[];
+  sweepCoverageRowsJS(rpts, sideSpacing, forwardSpacing, excludePolys, boundaryMargin)
+    .forEach(function(row){ row.forEach(function(seg){ pts=pts.concat(seg); }); });
   return pts;
+}
+function sweepSegmentCountJS(rpts, sideSpacing, forwardSpacing, excludePolys, boundaryMargin){
+  var n=0;
+  sweepCoverageRowsJS(rpts, sideSpacing, forwardSpacing, excludePolys, boundaryMargin)
+    .forEach(function(row){ n += row.length; });
+  return n;
 }
 function estimateGrid(polygon, c, exclusions){
   if(!polygon || polygon.length<3) return null;
@@ -2252,12 +2921,15 @@ function estimateGrid(polygon, c, exclusions){
   var exPolys=projectExclusionsJS(exclusions, refLat, refLon, cf, sf);
   var sp=coverageSpacing(c);
   var side=sp[0], forward=sp[1];
-  var margin=side/2; // mirrors _near_polygon's margin in generate_grid -- keeps this live estimate in sync with the real export
-  var count=sweepCoverageJS(rpts, side, forward, exPolys, margin).length;
+  var margin=side/2; // mirrors generate_grid's boundary margin -- keeps this live estimate in sync with the real export
+  var rows=sweepCoverageRowsJS(rpts, side, forward, exPolys, margin);
+  var count=0, segCount=0;
+  rows.forEach(function(row){ segCount+=row.length; row.forEach(function(s){ count+=s.length; }); });
   if(c.crosshatch && !c.threeDMapping){
     var transposed=rpts.map(p=>[p[1],p[0]]);
     var exTransposed=exPolys.map(poly=>poly.map(p=>[p[1],p[0]]));
     count += sweepCoverageJS(transposed, side, forward, exTransposed, margin).length;
+    segCount += sweepSegmentCountJS(transposed, side, forward, exTransposed, margin);
   }
   if(c.threeDMapping){
     // Mirrors generate_3d_mapping: a second full pass rotated 90°, oblique gimbal.
@@ -2265,20 +2937,43 @@ function estimateGrid(polygon, c, exclusions){
     var rpts2=pts.map(p=>[p[0]*cf2-p[1]*sf2, p[0]*sf2+p[1]*cf2]);
     var exPolys2=projectExclusionsJS(exclusions, refLat, refLon, cf2, sf2);
     count += sweepCoverageJS(rpts2, side, forward, exPolys2, margin).length;
+    segCount += sweepSegmentCountJS(rpts2, side, forward, exPolys2, margin);
   }
-  var xs=rpts.map(p=>p[0]), ys=rpts.map(p=>p[1]);
-  var passes=Math.max(1,Math.round((Math.max.apply(null,ys)-Math.min.apply(null,ys))/side)+1);
-  return {side:side.toFixed(1), forward:forward.toFixed(1), passes:passes, photos:count};
+  // passes = the real number of scan rows, straight from the sweep, rather
+  // than re-deriving it from the bounding-box height (which ignored where the
+  // rows actually landed).
+  return {side:side.toFixed(1), forward:forward.toFixed(1),
+          passes:Math.max(1, rows.length), segments:Math.max(1, segCount), photos:count};
 }
 function estimateCorridor(line, c){
   if(!line || line.length<2) return null;
+  // Measure in the SAME local-xy projection the generator uses, not with
+  // haversine: to_xy's constants and the haversine sphere differ by ~0.1%,
+  // which is invisible until it lands either side of a ceil() boundary and
+  // the estimate reports one photo per pass fewer than the mission actually
+  // contains (seen at 640 m, correct at 350 m and 910 m).
+  var lref=line[0];
+  var lxy=line.map(function(q){ return toXY(q[0],q[1],lref[0],lref[1]); });
   var length=0;
-  for(var i=1;i<line.length;i++) length+=haversine(line[i-1][0],line[i-1][1],line[i][0],line[i][1]);
+  for(var i=1;i<lxy.length;i++) length+=Math.hypot(lxy[i][0]-lxy[i-1][0], lxy[i][1]-lxy[i-1][1]);
   var sp=coverageSpacing(c);
+  var side=sp[0], forward=sp[1];
   var width=Math.max(0,c.corridorWidth||0);
-  var passes = width<=0 ? 1 : Math.max(1,Math.ceil(width/sp[0])+1);
-  var perPass=Math.max(1,Math.round(length/sp[1])+1);
-  return {side:sp[0].toFixed(1), forward:sp[1].toFixed(1), passes:passes, photos:passes*perPass};
+  // Mirrors corridor_photo_points: passes span the corridor width PLUS a
+  // half-line-spacing margin on each side, and each pass is extended by that
+  // same margin past both ends of the route before being sampled. Without
+  // the margin terms this under-counted every corridor.
+  var margin=side/2;
+  var span=width+2*margin;
+  var passes = width<=0 ? 1 : Math.max(2, Math.ceil(span/side)+1);
+  var passLen = length + 2*margin;
+  var perPass = Math.max(1, Math.ceil(passLen/forward)) + 1;
+  // Exclusion zones aren't subtracted here (unlike the grid estimate, which
+  // has exact interval geometry to work with). They can only ever remove
+  // photos, so this stays an upper bound -- the safe direction for the
+  // battery/file-count warnings this feeds.
+  return {side:side.toFixed(1), forward:forward.toFixed(1), passes:passes,
+          segments:passes, photos:passes*perPass};
 }
 function refreshEstimate(){
   var el=document.getElementById('live-estimate');
@@ -2311,21 +3006,19 @@ function refreshEstimate(){
     flightSec = legCount * legTimeSec(Number(est.forward), cfg.speed||1, cfg.droneAccel, mustStop);
     estWpCount = est.photos;
   } else {
-    // Turn Only: real waypoints are sparse (row/pass endpoints only,
-    // continuous cruise within each at rowSpeed, derived from the camera's
-    // own fixed interval timer) instead of one stop per photo -- see
-    // generate_grid's Python comment for why. Model total covered distance as
-    // continuous cruise at rowSpeed, plus one brief accel/decel turn per
-    // pass (side-spacing hop, always a real stop since that's an actual
-    // direction reversal).
+    // Turn Only: waypoints are sparse (row endpoints only, continuous cruise
+    // between them at rowSpeed). Model it as continuous cruise plus one
+    // accel/decel turn per pass, since a row reversal is always a real stop.
     var totalDist = Math.max(0, est.photos-1) * Number(est.forward);
     var turns = Math.max(0, (est.passes||1) - 1);
     var turnSec = turns * legTimeSec(Number(est.side)||Number(est.forward), rowSpeed, cfg.droneAccel, true);
     flightSec = totalDist/rowSpeed + turnSec;
-    // Real waypoint count is sparse (row/pass endpoints only, roughly 2 per
-    // pass) -- see generate_grid's comment. That's what the RC2's per-file
-    // limit actually applies to, not the dense photo count.
-    estWpCount = (est.passes||1)*2;
+    // Two waypoints per flyable STRETCH, not per pass: a no-fly zone splits
+    // rows into several stretches, each costing its own pair. Slightly under-
+    // counts when zones are present (the routing detour points can't be known
+    // without running the full pass -- 42 vs 45 actual in testing); the
+    // warning shown after generating uses the real waypoint array and is exact.
+    estWpCount = (est.segments || est.passes || 1) * 2;
   }
   var usableSec = usableBatteryMinutes(cfg)*60;
   var battBatches = Math.max(1, Math.ceil(flightSec/usableSec));
@@ -2383,6 +3076,21 @@ var snapGroup = L.layerGroup().addTo(map);
 var exclusionGroup = L.layerGroup().addTo(map);
 var gcpGroup = L.layerGroup().addTo(map);
 var geoGroup = L.layerGroup().addTo(map); // "you are here" marker from the geolocate button, kept separate from tempGroup so it isn't wiped by cancelDraw()
+// Keeps a hand-drawn boundary on the map after drawing finishes: cancelDraw()
+// clears tempGroup, which otherwise made the traced shape vanish. Separate from
+// tempGroup (in-progress) and importedGroup (KMZ shapes are already drawn).
+var pendingBoundaryGroup = L.layerGroup().addTo(map);
+function redrawPendingBoundary(){
+  pendingBoundaryGroup.clearLayers();
+  if(!pendingGeom) return;
+  if(pendingKind==='grid'){
+    L.polygon(pendingGeom, {color:'#4488ff', weight:2, fillOpacity:.06, dashArray:'6,4'}).addTo(pendingBoundaryGroup);
+  } else if(pendingKind==='corridor'){
+    L.polyline(pendingGeom, {color:'#4488ff', weight:2, dashArray:'6,4'}).addTo(pendingBoundaryGroup);
+  } else if(pendingKind==='orbit'){
+    L.circleMarker(pendingGeom, {radius:6, color:'#4488ff', weight:2, fillOpacity:.3}).addTo(pendingBoundaryGroup);
+  }
+}
 var wpPathLayer = null;
 var wpMarkers = {};
 
@@ -2462,18 +3170,191 @@ function mapGeolocate(){
   }, {enableHighAccuracy:true, timeout:12000});
 }
 
+// ── Splashscreen ───────────────────────────────────────────────────────────
+// Visible from the very first paint (static HTML, no JS needed to show it) so
+// it genuinely covers the presets/settings load, then holds a minimum beat so
+// it reads as a deliberate opening rather than a flicker.
+var _splashT0 = Date.now();
+var _splashHidden = false;
+function hideSplash(){
+  if(_splashHidden) return;
+  _splashHidden = true;
+  var el = document.getElementById('splash');
+  if(!el) return;
+  var wait = Math.max(0, 1400 - (Date.now() - _splashT0));
+  setTimeout(function(){
+    el.classList.add('fading');
+    setTimeout(function(){ el.style.display='none'; }, 500);
+  }, wait);
+}
+// Failsafe: never strand the user behind the splash if pywebviewready doesn't
+// fire (e.g. opening the served page in a plain browser during development).
+setTimeout(hideSplash, 6000);
+
+// ── Interactive tutorial ───────────────────────────────────────────────────
+// Spotlight walkthrough: dims everything except the current step's target
+// (one element + a huge box-shadow, no canvas tricks), with a card explaining
+// it. Steps can switch sidebar tabs so their target actually exists when
+// measured. Replayable anytime from the Tutorial button in the titlebar;
+// offered automatically exactly once on first launch (persisted via the
+// Python-side settings file, NOT localStorage -- see get_app_settings).
+var TOUR_STEPS = [
+  {title:'Welcome to Drone Mission Planner',
+   body:'Plan DJI waypoint missions on a real map and export them as WPML <b>.kmz</b> files your RC2 controller flies directly.<br><br>This tour takes about two minutes. Use the buttons or the <b>&#8592; &#8594;</b> arrow keys; Esc leaves at any point. Replay it anytime from the &#127891; Tutorial button up top.'},
+  {title:'Four mission types', target:'.mission-type-grid', tab:'setup',
+   body:'<b>Grid Survey</b> sweeps an area in parallel rows for mapping/photogrammetry. <b>Corridor</b> follows a path (road, river, dig transect). <b>Orbit</b> circles a point of interest. <b>Manual</b> places waypoints one by one.<br><br>Click one, then click corners on the map to define your shape.'},
+  {title:'Drawing on the map', target:'#map', pad:-6,
+   body:'While drawing: <b>click</b> places a point, <b>right-click</b> (or Backspace) undoes the last one, <b>double-click</b> or Enter finishes, Esc cancels.<br><br>The banner up top shows the traced distance live, and clicks snap onto imported KML/KMZ shapes when you have any.'},
+  {title:'Find your site', target:'#map-search',
+   body:'Search any place or address (free OpenStreetMap geocoder), or hit &#128205; to jump to your current location.'},
+  {title:'Basemaps', target:'.leaflet-control-layers',
+   body:'Switch between street, satellite (Esri and Google), topographic and dark basemaps here — plus toggles for each overlay (flight path, no-fly zones, GCPs, imports). Satellite coverage quality varies by region, so try both providers over your site.'},
+  {title:'Bring your own shapes', target:'#btn-import',
+   body:'Import <b>KML/KMZ</b> files from Google Earth, QGIS or another planner. Polygons can become grid areas, lines become corridor routes or raw waypoints — check the <b>Layers</b> tab after importing. A line that closes back on itself is detected and offered as an area.'},
+  {title:'No-fly zones & ground control', target:'#sec-site-markup', tab:'setup',
+   body:'Draw a <b>no-fly zone</b> inside a survey area and the flight path is cut around it — rows stop exactly at its edge and the aircraft is routed around rather than straight across it.<br><br><b>GCPs</b> mark where you\'ll place physical ground targets. After the flight, type in each one\'s surveyed coordinate and export a CSV for Pix4D / Metashape / WebODM.'},
+  {title:'Flight parameters', target:'#sec-flight', tab:'setup',
+   body:'<b>Altitude</b> is the big one — it sets the photo footprint and ground resolution (GSD), which drive photo spacing and flight time. The camera line under Aircraft &amp; camera updates live as you change it.'},
+  {title:'Overlap, rotation & waypoint mode', target:'#sec-mission-specific', tab:'setup',
+   body:'Overlap %s control photogrammetry quality. Grid rotation aligns rows to your area automatically (tweak or wind-align manually here).<br><br><b>Turn Only</b> mode needs the camera set to <b>interval shooting</b> manually before takeoff — the app shows the exact interval and speed to use. <b>Full</b> mode stops for every photo instead: simpler, but jittery on dense grids.'},
+  {title:'Waypoints & layers', target:'#tabs',
+   body:'After generating, the <b>Waypoints</b> tab lists every point — edit altitude, speed or gimbal per point, drag markers on the map, replay the flight at speed, or apply <b>terrain-following</b> altitude over sloped ground. <b>Layers</b> holds your imports.'},
+  {title:'Live mission stats', target:'#wp-stats',
+   body:'Total distance, realistic flight time (acceleration-aware, not just distance&divide;speed), photo count — and warnings when the mission needs multiple batteries or exceeds the safe per-file waypoint limit.'},
+  {title:'Export & fly', target:'#tgroup-export',
+   body:'<b>Export WPML</b> writes the .kmz your drone flies. <b>Export by Battery</b> splits a big mission into legs sized to your real usable endurance. <b>Upload to RC</b> pushes straight into a mission slot on a USB-connected RC2.'},
+  {title:'Safety nets', target:'#tgroup-file',
+   body:'<b>Save/Load</b> stores the whole project (mission, zones, GCPs, settings) as a file. Undo/redo (<b>Ctrl+Z / Ctrl+Y</b>) covers drawing, generating, imports and deletions.'},
+  {title:'Before every flight',
+   body:'&#128247; In Turn Only mode, set the camera&rsquo;s interval timer to the shown value — the app can&rsquo;t do that for you.<br>&#128267; Check the battery warnings in the stats bar.<br>&#128065; Keep visual line of sight and respect local regulations.<br><br>Good flying! Replay this tour anytime via &#127891; Tutorial.'},
+];
+var tourIdx = -1;
+var tourActive = false;
+function startTour(){
+  if(drawMode) cancelDraw();
+  closeDronePicker();
+  tourActive = true;
+  tourIdx = -1;
+  document.getElementById('tour-overlay').classList.add('visible');
+  window.addEventListener('resize', tourReposition);
+  document.addEventListener('keydown', tourKeys, true);
+  tourStep(1);
+}
+function tourKeys(e){
+  if(!tourActive) return;
+  if(e.key==='Escape'){ e.preventDefault(); e.stopPropagation(); endTour(); }
+  else if(e.key==='ArrowRight' || e.key==='Enter'){ e.preventDefault(); e.stopPropagation(); tourStep(1); }
+  else if(e.key==='ArrowLeft'){ e.preventDefault(); e.stopPropagation(); tourStep(-1); }
+}
+function tourStep(delta){
+  var next = tourIdx + delta;
+  if(next >= TOUR_STEPS.length){ endTour(); return; }
+  if(next < 0) next = 0;
+  tourIdx = next;
+  var s = TOUR_STEPS[tourIdx];
+  if(s.tab && activeTab !== s.tab) showTab(s.tab);
+  document.getElementById('tour-title').innerHTML = s.title;
+  document.getElementById('tour-body').innerHTML = s.body;
+  document.getElementById('tour-count').textContent = (tourIdx+1)+' / '+TOUR_STEPS.length;
+  document.getElementById('tour-back').disabled = tourIdx===0;
+  document.getElementById('tour-next').innerHTML = (tourIdx===TOUR_STEPS.length-1) ? 'Finish &#10003;' : 'Next &#8594;';
+  // The sidebar scrolls independently and is much taller than the window, so
+  // several steps' targets start well below the fold -- bring the target into
+  // view before measuring, or the spotlight lands off-screen on a target the
+  // user can't see. Verified: #tab-content scrollHeight was 1877px against
+  // ~796px visible.
+  if(s.target){
+    var tEl = document.querySelector(s.target);
+    if(tEl && tEl.scrollIntoView){
+      try{ tEl.scrollIntoView({block:'center', inline:'nearest'}); }catch(e){ tEl.scrollIntoView(); }
+    }
+  }
+  // Position synchronously, then again shortly after to catch late layout
+  // shifts. Deliberately not requestAnimationFrame: rAF never fires while the
+  // window isn't compositing, which would leave the spotlight unpositioned.
+  tourReposition();
+  setTimeout(tourReposition, 90);
+}
+function tourReposition(){
+  if(!tourActive || tourIdx<0) return;
+  var s = TOUR_STEPS[tourIdx];
+  var sp = document.getElementById('tour-spotlight');
+  var card = document.getElementById('tour-card');
+  var r = null;
+  if(s.target){
+    var el = document.querySelector(s.target);
+    if(el){
+      var b = el.getBoundingClientRect();
+      if(b.width>0 && b.height>0) r = b;
+    }
+  }
+  var vw = window.innerWidth, vh = window.innerHeight;
+  var cw = card.offsetWidth || 308, ch = card.offsetHeight || 200;
+  if(r){
+    var pad = (s.pad!=null) ? s.pad : 8;
+    sp.classList.remove('hidden-target');
+    sp.style.top = (r.top-pad)+'px';
+    sp.style.left = (r.left-pad)+'px';
+    sp.style.width = (r.width+pad*2)+'px';
+    sp.style.height = (r.height+pad*2)+'px';
+    // Card: prefer beside the spotlight (right, then left), else below/above.
+    var gap = 14, top, left;
+    if(r.right + gap + cw < vw - 10){ left = r.right + gap; top = r.top; }
+    else if(r.left - gap - cw > 10){ left = r.left - gap - cw; top = r.top; }
+    else if(r.bottom + gap + ch < vh - 10){ left = r.left + r.width/2 - cw/2; top = r.bottom + gap; }
+    else { left = r.left + r.width/2 - cw/2; top = r.top - gap - ch; }
+    card.style.top = Math.max(10, Math.min(vh - ch - 10, top))+'px';
+    card.style.left = Math.max(10, Math.min(vw - cw - 10, left))+'px';
+  } else {
+    sp.classList.add('hidden-target');
+    // Park the collapsed spotlight at center so its giant shadow still dims
+    // the whole screen for target-less (welcome/closing) steps.
+    sp.style.top = (vh/2)+'px'; sp.style.left = (vw/2)+'px';
+    sp.style.width = '0px'; sp.style.height = '0px';
+    card.style.top = (vh/2 - ch/2)+'px';
+    card.style.left = (vw/2 - cw/2)+'px';
+  }
+}
+function endTour(){
+  tourActive = false;
+  document.getElementById('tour-overlay').classList.remove('visible');
+  window.removeEventListener('resize', tourReposition);
+  document.removeEventListener('keydown', tourKeys, true);
+  if(window.pywebview) pywebview.api.set_app_setting('tutorialSeen', true);
+}
+var pendingTourOffer = false;
+function offerTour(){
+  document.getElementById('tour-welcome-overlay').classList.add('visible');
+}
+function closeTourWelcome(start){
+  document.getElementById('tour-welcome-overlay').classList.remove('visible');
+  if(window.pywebview) pywebview.api.set_app_setting('tutorialSeen', true);
+  if(start) startTour();
+}
+
 // ── Init ───────────────────────────────────────────────────────────────────
 function init(){
-  pywebview.api.get_presets().then(function(p){
-    PRESETS = p;
-    cfg = Object.assign({}, p.defaults);
-    var saved = null;
-    try{ saved = localStorage.getItem('dmp_drone'); }catch(e){}
+  Promise.all([pywebview.api.get_presets(), pywebview.api.get_app_settings()]).then(function(res){
+    PRESETS = res[0];
+    var vEl = document.getElementById('app-version');
+    if(vEl && PRESETS.version) vEl.textContent = 'v' + PRESETS.version;
+    var st = (res[1] && res[1].settings) || {};
+    cfg = Object.assign({}, PRESETS.defaults);
+    // Drone choice: Python settings file first (survives everything), then
+    // localStorage (kept for projects saved before the settings file existed).
+    var saved = st.drone || null;
+    if(!saved){ try{ saved = localStorage.getItem('dmp_drone'); }catch(e){} }
+    var firstRun = !st.tutorialSeen;
+    hideSplash();
     if(saved && PRESETS.drones[saved]){
       setDrone(saved);
+      if(firstRun) setTimeout(offerTour, 2000);
     } else {
       renderSetup();
       showDronePicker();
+      // Don't stack the tour offer on top of the drone picker -- it follows
+      // once the picker closes (see closeDronePicker).
+      pendingTourOffer = firstRun;
     }
   });
 }
@@ -2489,7 +3370,12 @@ function showDronePicker(){
   }).join('');
   document.getElementById('drone-picker-overlay').classList.add('visible');
 }
-function closeDronePicker(){ document.getElementById('drone-picker-overlay').classList.remove('visible'); }
+function closeDronePicker(){
+  document.getElementById('drone-picker-overlay').classList.remove('visible');
+  // First launch stacks two onboarding moments (drone pick, then tour offer) --
+  // sequenced so they never sit on top of each other.
+  if(pendingTourOffer){ pendingTourOffer=false; setTimeout(offerTour, 400); }
+}
 
 // ── Tabs ───────────────────────────────────────────────────────────────────
 function showTab(name){
@@ -2537,12 +3423,9 @@ function setGimbalPreset(k){
   if(g && k!=='custom'){
     cfg.gimbalPitch=g.pitch;
     if(g.overlap){ cfg.forwardOverlap=g.overlap[0]; cfg.sideOverlap=g.overlap[1]; }
-    // A preset fully determines whether this is a 3D-mapping (nadir+oblique)
-    // capture or not -- otherwise switching presets can leave 3D mapping
-    // silently on (or off) from whatever was picked before, and the "Gimbal
-    // pitch" field above would be setting a value the generator ignores once
-    // 3D mapping is active (it hardcodes nadir to -90 and uses the separate
-    // "Oblique pass gimbal pitch" field instead).
+    // A preset fully determines whether this is a 3D (nadir+oblique) capture,
+    // so switching presets can't leave 3D mapping silently on from a previous
+    // choice -- which would make the Gimbal pitch field above a no-op.
     cfg.threeDMapping = !!g.threeD;
     if(g.threeD) cfg.obliqueGimbal = g.pitch;
   }
@@ -2583,14 +3466,14 @@ function renderSetup(){
     '<div class="panel-section"><h4>New mission</h4>' +
     '<div class="field"><label>Mission name (export filename prefix)</label><input type="text" value="'+missionName+'" onchange="setMissionName(this.value)"></div>' +
     '<div class="mission-type-grid">' +
-      '<button onclick="startDraw(\'area\')">&#9723;<br>Grid Survey</button>' +
-      '<button onclick="startDraw(\'route\')">&#9646;<br>Corridor</button>' +
-      '<button onclick="startDraw(\'orbit\')">&#9678;<br>Orbit</button>' +
-      '<button onclick="startDraw(\'manual\')">&#128204;<br>Manual</button>' +
+      missionTypeBtn('area','Grid Survey',MISSION_ICONS.area,'Sweep an area in parallel rows — mapping &amp; photogrammetry') +
+      missionTypeBtn('route','Corridor',MISSION_ICONS.route,'Follow a path — road, river, pipeline, transect') +
+      missionTypeBtn('orbit','Orbit',MISSION_ICONS.orbit,'Circle a point of interest, camera locked on it') +
+      missionTypeBtn('manual','Manual',MISSION_ICONS.manual,'Place individual waypoints one by one') +
     '</div></div>' +
 
     // ── Site markup — no-fly holes and survey-control reference points ──
-    '<div class="panel-section"><h4>Site markup</h4>' +
+    '<div class="panel-section" id="sec-site-markup"><h4>Site markup</h4>' +
     '<button style="width:100%;" onclick="startDraw(\'exclude\')" title="Draw a hole inside a grid survey area that the flight path skips entirely">&#9888; Draw no-fly zone</button>' +
     '<button style="width:100%;margin-top:6px;" onclick="startDraw(\'gcp\')" title="Click roughly where you plan to place a physical ground marker before flying -- you\'ll refine the exact coordinate here once you\'ve measured it in the field.">&#128204; Place GCP</button>' +
     (exclusionZones.length ?
@@ -2605,7 +3488,7 @@ function renderSetup(){
     '</div>' +
 
     // ── Core flight parameters (always visible — used by every mission type) ──
-    '<div class="panel-section"><h4>Flight</h4>' +
+    '<div class="panel-section" id="sec-flight"><h4>Flight</h4>' +
     '<div class="field-row">' +
       '<div class="field"><label>Altitude (m AGL)</label><input type="number" value="'+cfg.altitude+'" onchange="cfg.altitude=parseFloat(this.value)||10;refreshEstimate()"></div>' +
       '<div class="field"><label>Speed (m/s)</label><input type="number" value="'+cfg.speed+'" onchange="cfg.speed=parseFloat(this.value)||1"></div>' +
@@ -2633,7 +3516,7 @@ function renderSetup(){
     '</div>' +
 
     // ── Per-mission-type settings, collapsed except the currently relevant one ──
-    '<div class="panel-section"><h4>Mission-specific settings</h4>' +
+    '<div class="panel-section" id="sec-mission-specific"><h4>Mission-specific settings</h4>' +
     '<details'+op('grid')+' class="'+(currentKind==='grid'?'active-kind':'')+'"><summary>Grid survey'+badge('grid')+'</summary><div class="details-body">' +
       '<div class="field"><label>Waypoint mode'+help('Turn Only (recommended): sparse waypoints at each row\'s start/end only, camera fires on its own interval timer during continuous flight -- avoids the position-hold jitter and RC2 waypoint-count problems a dense mission can hit, but needs the camera manually set to Timer/interval mode before flight (see Camera interval under Advanced). Full: a real stop-and-shoot waypoint at every photo, no manual step needed -- matches how YMapper and Waypoint OS both default, and how a hand-made DJI Fly mission works -- but can cause visible jitter at close spacing (aircraft settling within hover-accuracy tolerance at every stop) and can hit the RC2\'s waypoint-count limit on a larger survey.')+'</label>' +
         '<div class="field-row" style="gap:6px;">' +
@@ -2755,6 +3638,25 @@ function renderSetup(){
   renderGCPList();
   refreshEstimate();
 }
+// Matching line-art icons for the four mission types. These used to be three
+// geometric text glyphs plus one color emoji (◻ ▮ ◎ 📌), which rendered at
+// different weights/sizes and put a full-color pushpin next to flat outlines.
+// One consistent 24x24 stroke set instead, sharing the app's accent color.
+var MISSION_ICONS = {
+  area:'<path d="M3 5h18v14H3z"/><path d="M3 9.7h18M3 14.3h18"/>',
+  route:'<path d="M4 19c4 0 3-6 7-6s3-6 9-6"/><circle cx="4" cy="19" r="1.6" fill="currentColor" stroke="none"/><circle cx="20" cy="7" r="1.6" fill="currentColor" stroke="none"/>',
+  orbit:'<ellipse cx="12" cy="12" rx="9" ry="5.2"/><circle cx="12" cy="12" r="2.2" fill="currentColor" stroke="none"/>',
+  manual:'<circle cx="6" cy="7" r="1.9" fill="currentColor" stroke="none"/><circle cx="17" cy="10" r="1.9" fill="currentColor" stroke="none"/><circle cx="9" cy="18" r="1.9" fill="currentColor" stroke="none"/><path d="M6 7l11 3-8 8" stroke-dasharray="3 2.5"/>',
+};
+function missionTypeBtn(mode, label, icon, tip){
+  // Modes map onto drawMode names except 'area'/'route', which produce grid
+  // and corridor missions respectively -- highlight whichever is armed so the
+  // sidebar shows what the map clicks are currently doing.
+  var on = (drawMode===mode) ? ' active' : '';
+  return '<button class="mission-type-btn'+on+'" onclick="startDraw(\''+mode+'\')" title="'+tip+'">' +
+    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">'+icon+'</svg>' +
+    '<span>'+label+'</span></button>';
+}
 function opt(val,cur,label){ return '<option value="'+val+'"'+(cur===val?' selected':'')+'>'+label+'</option>'; }
 // A small hover-only "?" badge for the longer explanatory/citation text that used
 // to sit permanently under a field as a paragraph -- native title tooltip, so it
@@ -2765,7 +3667,11 @@ function setDrone(k){
   cfg.drone=k; var d=PRESETS.drones[k];
   cfg.droneEnumValue=d.droneEnumValue; cfg.droneSubEnumValue=d.droneSubEnumValue;
   if(d.batteries && d.batteries.length){ cfg.batteryIdx=0; cfg.batteryMinutes=d.batteries[0].minutes; }
+  // Persisted via the Python settings file, not just localStorage -- browser
+  // storage is origin-scoped, and this page's origin includes the local
+  // server's port, so it silently resets if the port ever changes.
   try{ localStorage.setItem('dmp_drone', k); }catch(e){}
+  if(window.pywebview) pywebview.api.set_app_setting('drone', k);
   if(d.defaultCamera) setCamera(d.defaultCamera); else renderSetup();
 }
 function setCamera(k){
@@ -2829,49 +3735,77 @@ function promptMissionName(){
   var name = window.prompt('Mission name (used as the export filename prefix):', missionName);
   if(name!==null && name.trim()!=='') missionName = sanitizeMissionName(name);
 }
+var drawHintBase = ''; // startDraw's per-mode instructions, kept separate from the live distance suffix appended in redrawTemp/mousemove
 function startDraw(mode){
   if(mode!=='exclude' && mode!=='gcp') promptMissionName();
   drawMode = mode; tempPoints = [];
   tempGroup.clearLayers();
+  // Double-click finishes the shape while drawing -- the map's own
+  // double-click zoom would fight that, so it's parked until cancelDraw.
+  map.doubleClickZoom.disable();
   var hint = document.getElementById('draw-hint');
   hint.classList.add('visible');
   document.getElementById('btn-finish').style.display = (mode==='orbit'||mode==='manual'||mode==='gcp') ? 'none' : 'inline-block';
   document.getElementById('btn-cancel').style.display = 'inline-block';
   var snapNote = importedLayers.length ? ' Clicks near an imported line/point snap to it.' : '';
-  if(mode==='area') hint.textContent='Click to add area corners (min. 3). Click "Finish" when done.'+snapNote;
-  if(mode==='route') hint.textContent='Click to add route points (min. 2). Click "Finish" when done.'+snapNote;
-  if(mode==='orbit') hint.textContent='Click on the map to place the orbit center.'+snapNote;
-  if(mode==='manual') hint.textContent='Click to add waypoints. Click "Cancel" or switch tools to stop.'+snapNote;
-  if(mode==='exclude') hint.textContent='Click to add corners of a no-fly hole (min. 3). Click "Finish" when done.'+snapNote;
-  if(mode==='gcp') hint.textContent='Click to drop ground control points. Click "Cancel" or switch tools to stop.'+snapNote;
+  var keysNote = ' Right-click undoes a point · double-click or Enter finishes · Esc cancels.';
+  if(mode==='area') drawHintBase='Click to add area corners (min. 3).'+keysNote+snapNote;
+  if(mode==='route') drawHintBase='Click to add route points (min. 2).'+keysNote+snapNote;
+  if(mode==='orbit') drawHintBase='Click on the map to place the orbit center. Esc cancels.'+snapNote;
+  if(mode==='manual') drawHintBase='Click to add waypoints. Esc or "Cancel" stops.'+snapNote;
+  if(mode==='exclude') drawHintBase='Click to add corners of a no-fly hole (min. 3).'+keysNote+snapNote;
+  if(mode==='gcp') drawHintBase='Click to drop ground control points. Esc or "Cancel" stops.'+snapNote;
+  hint.textContent = drawHintBase;
+  if(activeTab==='setup') renderSetup(); // reflect the armed tool on the mission-type buttons
+}
+function removeLastTempPoint(){
+  if(!(drawMode==='area' || drawMode==='route' || drawMode==='exclude')) return;
+  if(!tempPoints.length) return;
+  tempPoints.pop();
+  redrawTemp();
+  updateDrawHintDistance(null);
+}
+// Traced-so-far perimeter/path length, live while placing area/route/exclude
+// points -- optionally plus one more live segment out to the cursor so it
+// updates continuously between clicks, not just after each one.
+function updateDrawHintDistance(cursorLatLng){
+  if(!(drawMode==='area' || drawMode==='route' || drawMode==='exclude')) return;
+  var hint = document.getElementById('draw-hint');
+  if(tempPoints.length===0){ hint.textContent = drawHintBase; return; }
+  var dist = 0;
+  for(var i=1;i<tempPoints.length;i++){
+    dist += haversine(tempPoints[i-1][0],tempPoints[i-1][1], tempPoints[i][0],tempPoints[i][1]);
+  }
+  var last = tempPoints[tempPoints.length-1];
+  if(cursorLatLng) dist += haversine(last[0],last[1], cursorLatLng.lat,cursorLatLng.lng);
+  var label = (drawMode==='area' ? 'Perimeter so far' : 'Length so far');
+  hint.textContent = drawHintBase + '  —  ' + label + ': ' + (dist/1000).toFixed(2) + ' km';
 }
 function cancelDraw(){
+  var wasDrawing = !!drawMode;
   drawMode = null; tempPoints = [];
   tempGroup.clearLayers();
   snapGroup.clearLayers();
+  map.doubleClickZoom.enable();
+  map.getContainer().style.cursor='';
   document.getElementById('draw-hint').classList.remove('visible');
   document.getElementById('btn-finish').style.display='none';
   document.getElementById('btn-cancel').style.display='none';
+  // Clear the armed-tool highlight. finishDraw calls cancelDraw then showTab
+  // ('setup') itself, so this only needs to cover a bare cancel.
+  if(wasDrawing && activeTab==='setup') renderSetup();
 }
 
 // ── Snap-to-import: pull drawn points onto imported KML/KMZ vertices/edges ──
-// Two different snap radii on purpose: a corner/vertex is a real, exact point
-// someone will want to land on precisely, so it gets a bigger "sticky" catch
-// radius. A point along the middle of a line is an inferred, approximate
-// position, so it only gets a smaller "soft" radius -- easy to land on if
-// you're aiming for it, but it won't reach out and grab the cursor from
-// across the whole click tolerance the way a vertex does.
+// Two radii on purpose: a vertex is an exact point worth landing on precisely,
+// so it gets a bigger sticky radius; a position along an edge is inferred, so
+// it only gets a small soft radius that won't yank the cursor across.
 var SNAP_PX_VERTEX = 18;
 var SNAP_PX_EDGE = 9;
-// A vertex only counts as a real, sticky-worthy corner if it's far enough
-// from its immediate neighbors in the source geometry. A hand-drawn survey
-// boundary has a handful of corners tens/hundreds of meters apart -- those
-// deserve the strong pull. A GPS track or CAD-exported road/path can have a
-// vertex every few meters, and without this check every one of those would
-// grab the cursor just as hard as a real corner, making it impossible to
-// smoothly trace or lightly follow the path instead of being yanked through
-// its raw point-by-point digitization. Computed once per imported layer
-// (see computeIsolatedFlags), not per mousemove -- it doesn't depend on zoom.
+// A vertex is only sticky if it's far enough from its neighbours to be a real
+// corner. Without this, a GPS track or CAD path with a vertex every few metres
+// would grab the cursor at every one, making it impossible to trace smoothly.
+// Computed once per imported layer, not per mousemove -- it ignores zoom.
 var VERTEX_ISOLATION_M = 15;
 function computeIsolatedFlags(coords, closed){
   var n = coords.length;
@@ -2894,12 +3828,9 @@ function findSnapPoint(latlng){
   if(!importedLayers.length && !tempPoints.length) return null;
   var clickPt = map.latLngToContainerPoint(latlng);
   var bestVertex=null, bestVertexDist=SNAP_PX_VERTEX;
-  // Snap to the user's own in-progress drawing too, not just imported
-  // layers -- every point placed so far was a deliberate click, not GPS/
-  // digitizing noise, so all of them get the full sticky treatment. The
-  // main payoff: hovering back near your own first point pulls onto it
-  // exactly, so closing the loop into an area (see finishDraw) actually
-  // produces first===last instead of two merely-close-looking points.
+  // Also snap to the user's own in-progress points -- each was a deliberate
+  // click, so all get the sticky radius. This makes closing a loop land exactly
+  // on the first point rather than merely near it.
   tempPoints.forEach(function(c){
     var p=map.latLngToContainerPoint([c[0],c[1]]);
     var d=p.distanceTo(clickPt);
@@ -2962,6 +3893,7 @@ map.on('mousemove', function(e){
   // clicking here inserts a point onto the line, distinct from the strong
   // pull of a vertex (which already has its own larger, filled indicator).
   map.getContainer().style.cursor = (snap && !snap.onVertex) ? 'crosshair' : '';
+  updateDrawHintDistance(snap ? L.latLng(snap.point[0],snap.point[1]) : e.latlng);
 });
 
 map.on('click', function(e){
@@ -2971,15 +3903,54 @@ map.on('click', function(e){
   if(drawMode==='area' || drawMode==='route' || drawMode==='exclude'){
     tempPoints.push([lat,lon]);
     redrawTemp();
+    updateDrawHintDistance(null);
   } else if(drawMode==='orbit'){
+    pushHistory();
     pendingKind='orbit'; pendingGeom=[lat,lon]; pendingGenerated=false;
     cancelDraw();
+    redrawPendingBoundary();
     showTab('setup');
   } else if(drawMode==='manual'){
     addManualWaypoint(lat,lon);
   } else if(drawMode==='gcp'){
     addGCP(lat,lon);
   }
+});
+
+// Right-click while drawing = undo the last placed point (the standard GIS
+// digitizing gesture). The browser context menu is suppressed app-wide below,
+// so this can't accidentally open it mid-trace.
+map.on('contextmenu', function(e){
+  if(drawMode) removeLastTempPoint();
+});
+// Double-click = finish the shape. A double-click also fires two single
+// clicks first, which just placed two (nearly) coincident points at the
+// same spot -- drop the duplicate tail before finishing so the shape doesn't
+// carry a phantom zero-length edge.
+map.on('dblclick', function(e){
+  if(!(drawMode==='area' || drawMode==='route' || drawMode==='exclude')) return;
+  while(tempPoints.length>=2){
+    var a=tempPoints[tempPoints.length-2], b=tempPoints[tempPoints.length-1];
+    if(haversine(a[0],a[1],b[0],b[1]) < 0.5) tempPoints.pop();
+    else break;
+  }
+  finishDraw();
+});
+// This is a desktop app window, not a web page -- the browser's own
+// right-click menu (Reload, Back...) reads as broken UI here and Reload
+// would wipe the whole session's state.
+document.addEventListener('contextmenu', function(e){ e.preventDefault(); });
+// Drawing keyboard shortcuts. Kept separate from the Ctrl+Z/Y undo listener:
+// these are plain keys, only active while a draw tool is armed, and never
+// while typing in a field.
+document.addEventListener('keydown', function(e){
+  if(e.ctrlKey || e.metaKey || e.altKey) return;
+  var tag = document.activeElement ? document.activeElement.tagName : '';
+  if(tag==='INPUT' || tag==='TEXTAREA' || (document.activeElement && document.activeElement.isContentEditable)) return;
+  if(!drawMode) return;
+  if(e.key==='Escape'){ e.preventDefault(); cancelDraw(); }
+  else if(e.key==='Enter' && (drawMode==='area'||drawMode==='route'||drawMode==='exclude')){ e.preventDefault(); finishDraw(); }
+  else if(e.key==='Backspace' || e.key==='Delete'){ e.preventDefault(); removeLastTempPoint(); }
 });
 
 function redrawTemp(){
@@ -2997,19 +3968,16 @@ function redrawTemp(){
 }
 
 function finishDraw(){
+  pushHistory();
   if(drawMode==='area'){
     if(tempPoints.length<3){ alert('Add at least 3 points to define an area.'); return; }
     pendingKind='grid'; pendingGeom=tempPoints.slice(); pendingGenerated=false;
   } else if(drawMode==='route'){
     if(tempPoints.length<2){ alert('Add at least 2 points to define a route.'); return; }
-    // The last point can land back on the first just from snapping near a
-    // KMZ vertex close to where you started, not necessarily because you
-    // meant to close a loop -- so this asks instead of silently deciding.
-    // Auto-reclassifying without asking is exactly the kind of silent
-    // behavior-change this app has otherwise avoided (see GCP/upload-picker
-    // history); a closed LineString on KML import is different -- that's
-    // reading a file someone else's tool already saved as closed, not
-    // guessing live intent -- so that path still auto-classifies.
+    // The last point can land on the first just from snapping near a KMZ
+    // vertex, so this asks rather than silently reclassifying. KML import is
+    // different -- a closed LineString there is a saved fact, not a guess about
+    // live intent -- so that path still auto-classifies.
     var pts = tempPoints.slice();
     var closedLoop = pts.length>=4 &&
       haversine(pts[0][0],pts[0][1], pts[pts.length-1][0],pts[pts.length-1][1]) < 2;
@@ -3028,6 +3996,7 @@ function finishDraw(){
     refreshEstimate();
   }
   cancelDraw();
+  if(pendingKind==='grid' || pendingKind==='corridor') redrawPendingBoundary();
   if(pendingKind==='grid') autoRotate(true); // hand-clicked corners are never a perfect rectangle in screen coords --
                                               // align the sweep to the polygon's own longest edge by default so rows
                                               // come out uniform regardless of how the shape is tilted, instead of
@@ -3047,24 +4016,18 @@ function redrawExclusionZones(){
 function clearExclusionZones(){
   if(!exclusionZones.length) return;
   if(!confirm('Remove all '+exclusionZones.length+' exclusion zone(s)?')) return;
+  pushHistory();
   exclusionZones = [];
   redrawExclusionZones();
   refreshEstimate();
 }
 
 // ── Ground control points ───────────────────────────────────────────────────
-// The real workflow this supports: mark roughly where you plan to put a
-// physical ground marker (checkerboard target, painted cross, survey nail)
-// before flying, spread out for good coverage. After the flight, once you've
-// measured that marker's ACTUAL coordinate with something more precise than
-// a map click -- RTK GPS, a total station, even a good handheld unit -- come
-// back and type the real lat/lon/elevation in here and tick "Surveyed". Only
-// a surveyed GCP is actually worth feeding into Pix4D/Metashape/WebODM for
-// georeferencing; an un-surveyed one is just a planning placeholder, and
-// photogrammetry software genuinely wants X/Y/Z (elevation matters for
-// vertical accuracy, not just horizontal), which is why that field exists
-// here even though nothing else in this app uses elevation this way.
+// Workflow: mark roughly where each physical marker will go before flying;
+// afterwards enter its surveyed lat/lon/elevation and tick "Surveyed". Only a
+// surveyed GCP is worth feeding to Pix4D/Metashape/WebODM, which need X/Y/Z.
 function addGCP(lat,lon){
+  pushHistory();
   var label = 'GCP'+(gcpPoints.length+1);
   gcpPoints.push({lat:lat, lon:lon, elevation:0, notes:'', surveyed:false, label:label});
   redrawGCPs();
@@ -3097,12 +4060,14 @@ function updateGCP(i, field, value){
   else if(field==='surveyed') redrawGCPs();
 }
 function deleteGCP(i){
+  pushHistory();
   gcpPoints.splice(i,1);
   redrawGCPs();
 }
 function clearGCPs(){
   if(!gcpPoints.length) return;
   if(!confirm('Remove all '+gcpPoints.length+' ground control point(s)?')) return;
+  pushHistory();
   gcpPoints = [];
   redrawGCPs();
 }
@@ -3142,7 +4107,8 @@ function commitPending(){
   else if(pendingKind==='orbit') generateOrbitMission(pendingGeom);
 }
 function discardPending(){
-  pendingKind=null; pendingGeom=null; pendingGenerated=false; renderSetup();
+  pushHistory();
+  pendingKind=null; pendingGeom=null; pendingGenerated=false; redrawPendingBoundary(); renderSetup();
 }
 
 // A generate call that filtered out points for a marked no-fly zone hands back
@@ -3176,6 +4142,7 @@ function mergeOverviewIfEnabled(polygonForOverview){
 // Note: these don't clear pendingKind/pendingGeom, so the pending panel stays open
 // after generating and can be tuned + regenerated in place.
 function generateGridMission(polygon){
+  pushHistory();
   showProgress('Generating grid...');
   var exclusions = exclusionZones.map(function(z){ return z.coords; });
   pywebview.api.generate_grid(polygon, cfg, exclusions).then(function(res){
@@ -3194,6 +4161,7 @@ function generateGridMission(polygon){
   });
 }
 function generateCorridorMission(line){
+  pushHistory();
   showProgress('Generating corridor...');
   var exclusions = exclusionZones.map(function(z){ return z.coords; });
   pywebview.api.generate_corridor(line, cfg, exclusions).then(function(res){
@@ -3210,6 +4178,7 @@ function generateCorridorMission(line){
   });
 }
 function generateOrbitMission(center){
+  pushHistory();
   showProgress('Generating orbit...');
   pywebview.api.generate_orbit(center, cfg).then(function(res){
     hideProgress();
@@ -3227,6 +4196,7 @@ function isInsideAnyExclusionZone(lat,lon){
   return false;
 }
 function addManualWaypoint(lat,lon){
+  pushHistory();
   waypoints.push({lat:lat, lon:lon, alt:cfg.altitude, speed:cfg.speed, gimbal:cfg.gimbalPitch,
     heading_mode:'followWayline', heading_angle:0, photo:true, hover:cfg.delayAtWaypoint||0});
   renderWaypoints();
@@ -3242,8 +4212,10 @@ function addManualWaypoint(lat,lon){
 
 function clearMission(){
   if(waypoints.length && !confirm('Clear the current mission?')) return;
+  pushHistory();
   waypoints=[]; pois=[]; selectedWpIdx=null;
   pendingKind=null; pendingGeom=null; pendingGenerated=false;
+  redrawPendingBoundary();
   renderWaypoints();
   if(activeTab==='waypoints') renderWaypointsTab();
   if(activeTab==='setup') renderSetup();
@@ -3262,6 +4234,8 @@ function renderWaypoints(){
   replay.marker=null; replay.elapsed=0; replay.times=[0]; replay._curIdx=0; replay._curAlt=undefined;
   wpGroup.clearLayers(); wpMarkers={};
   if(wpPathLayer){ map.removeLayer(wpPathLayer); wpPathLayer=null; }
+  var badge=document.getElementById('tab-wp-count');
+  if(badge) badge.textContent = waypoints.length ? String(waypoints.length) : '';
   if(waypoints.length===0){ document.getElementById('wp-stats').innerHTML=''; return; }
 
   var latlngs = waypoints.map(w=>[w.lat,w.lon]);
@@ -3313,7 +4287,10 @@ function renderWaypointsTab(){
   var camReminder = '';
   if((pendingKind==='grid' || pendingKind==='corridor') && cfg.waypointMode!=='full'){
     var ci = cfg.cameraInterval||2.0;
-    var rowSpd = waypoints.find(w=>!w.photo && w.speed) ? waypoints[0].speed : null;
+    // Read the speed off an actual sparse (non-photo) waypoint -- waypoints[0]
+    // could be an appended overview-lap point flying a different speed.
+    var sparseWp = waypoints.find(w=>!w.photo && w.speed);
+    var rowSpd = sparseWp ? sparseWp.speed : null;
     camReminder = '<div class="hint warn" style="margin-bottom:8px;padding:8px 10px;border:1px solid var(--orange-dim);border-radius:var(--radius-sm);background:#1c1300;">' +
       '&#128247; <b>Before you fly:</b> set the camera to Timer/interval shooting at <b>'+ci.toFixed(1)+'s</b>'+
       (rowSpd?' and confirm cruise speed is ~<b>'+rowSpd.toFixed(1)+' m/s</b>':'')+
@@ -3341,6 +4318,7 @@ function applyTerrainFollow(){
   });
 }
 function deleteWaypoint(i){
+  pushHistory();
   waypoints.splice(i,1);
   if(selectedWpIdx===i) selectedWpIdx=null;
   renderWaypoints(); renderWaypointsTab();
@@ -3349,13 +4327,9 @@ function deleteWaypoint(i){
 function updateStats(){
   var dist=0;
   for(var i=1;i<waypoints.length;i++){ dist += haversine(waypoints[i-1].lat,waypoints[i-1].lon,waypoints[i].lat,waypoints[i].lon); }
-  // Turn Only grid/corridor waypoints carry photo:false (the camera's own
-  // interval timer takes the shots, not a per-waypoint action -- see
-  // generate_grid's Python comment), so their dense estimate is added back in
-  // here; Full mode already has a real photo:true on every shot, so adding
-  // the dense estimate on top would double-count. Any photo:true points from
-  // an appended overview lap, or an orbit/manual mission, count normally
-  // either way.
+  // Turn Only waypoints carry photo:false (the camera's interval timer takes
+  // the shots), so their dense estimate is added back here. Full mode already
+  // has photo:true per shot, where adding it would double-count.
   var isDenseKind = (pendingKind==='grid' || pendingKind==='corridor') && cfg.waypointMode!=='full';
   var photoCount = (isDenseKind ? lastEstimatedPhotos : 0) + waypoints.filter(w=>w.photo).length;
   var flightSec = computeFlightSeconds(waypoints, cfg);
@@ -3409,20 +4383,22 @@ function legTimeSec(distM, cruiseSpeed, accel, mustStop){
   if(distM >= 2*dHalf) return 2*(cruiseSpeed/accel) + (distM-2*dHalf)/cruiseSpeed;
   return 2*Math.sqrt(distM/accel);
 }
+// Single source of truth for leg duration -- the stats bar, live estimate and
+// replay clock all go through this, so they can't drift apart.
+function legSecondsBetween(a, b, c){
+  var accel = c.droneAccel||1.4, defaultTurn = c.turnMode||'toPointAndStopWithDiscontinuityCurvature';
+  var speed = a.speed || c.speed || 5;
+  var dist = haversine(a.lat,a.lon,b.lat,b.lon);
+  var mustStop = isStopTurn(a.turn_mode||defaultTurn) || isStopTurn(b.turn_mode||defaultTurn);
+  return legTimeSec(dist, speed, accel, mustStop);
+}
 // Shared, accel-aware flight-time calculation -- used everywhere flight time
-// is estimated instead of four separate dist/speed copies (each missing the
-// same acceleration physics; see the /loop this was fixed in for context).
+// is estimated instead of separate dist/speed copies (each missing the same
+// acceleration physics).
 function computeFlightSeconds(wps, c){
   if(!wps || wps.length<2) return (wps&&wps[0]&&wps[0].hover)||0;
-  var accel = c.droneAccel||1.4, defaultTurn = c.turnMode||'toPointAndStopWithDiscontinuityCurvature';
   var t = wps[0].hover||0;
-  for(var i=1;i<wps.length;i++){
-    var a=wps[i-1], b=wps[i];
-    var speed = a.speed || c.speed || 5;
-    var dist = haversine(a.lat,a.lon,b.lat,b.lon);
-    var mustStop = isStopTurn(a.turn_mode||defaultTurn) || isStopTurn(b.turn_mode||defaultTurn);
-    t += legTimeSec(dist, speed, accel, mustStop) + (b.hover||0);
-  }
+  for(var i=1;i<wps.length;i++) t += legSecondsBetween(wps[i-1], wps[i], c) + (wps[i].hover||0);
   return t;
 }
 
@@ -3450,11 +4426,12 @@ function replayPanelHtml(){
 }
 
 function prepareReplay(){
+  // Same accel-aware model as the stats bar, so the replay clock and reported
+  // flight time agree. Hover is attached to the leg's start here (its end in
+  // computeFlightSeconds) so the marker keeps moving; the totals are identical.
   var times=[0], t=0;
   for(var i=1;i<waypoints.length;i++){
-    var d=haversine(waypoints[i-1].lat,waypoints[i-1].lon,waypoints[i].lat,waypoints[i].lon);
-    var spd=waypoints[i-1].speed||cfg.speed||5;
-    t += d/spd + (waypoints[i-1].hover||0);
+    t += legSecondsBetween(waypoints[i-1], waypoints[i], cfg) + (waypoints[i-1].hover||0);
     times.push(t);
   }
   t += waypoints[waypoints.length-1].hover||0;
@@ -3559,6 +4536,7 @@ function importKml(){
   pywebview.api.import_kml().then(function(res){
     hideProgress();
     if(!res.ok){ if(res.msg!=='Cancelled') alert(res.msg); setStatus(res.msg); return; }
+    pushHistory();
     importedLayers = [];
     res.polygons.forEach(p=>importedLayers.push({kind:'polygon', name:p.name, coords:p.coords, isolated:computeIsolatedFlags(p.coords, true)}));
     res.lines.forEach(l=>importedLayers.push({kind:'line', name:l.name, coords:l.coords, isolated:computeIsolatedFlags(l.coords, false)}));
@@ -3572,6 +4550,7 @@ function importKml(){
 function clearImportedLayers(){
   if(!importedLayers.length) return;
   if(!confirm('Remove all '+importedLayers.length+' imported layer(s) from the map? You can re-import the file anytime.')) return;
+  pushHistory();
   importedLayers = [];
   importedGroup.clearLayers();
   updateImportButton();
@@ -3591,7 +4570,8 @@ function updateImportButton(){
     btn.title = '';
   }
 }
-function drawImportedLayers(){
+function drawImportedLayers(fitBounds){
+  if(fitBounds===undefined) fitBounds=true; // default true for the normal "just imported a file" case; undo/redo passes false so it doesn't yank the view
   importedGroup.clearLayers();
   var bounds=[];
   importedLayers.forEach(function(layer){
@@ -3606,7 +4586,7 @@ function drawImportedLayers(){
       bounds.push([layer.lat,layer.lon]);
     }
   });
-  if(bounds.length) map.fitBounds(bounds, {padding:[40,40]});
+  if(fitBounds && bounds.length) map.fitBounds(bounds, {padding:[40,40]});
 }
 function renderLayersTab(){
   if(activeTab!=='layers') return;
@@ -3624,10 +4604,11 @@ function renderLayersTab(){
     return '<div class="layer-item"><div class="name">'+kindLabel+': '+layer.name+'</div><div class="actions">'+actions+'</div></div>';
   }).join('') + '</div>';
 }
-function useLayerAsGrid(i){ pendingKind='grid'; pendingGeom=importedLayers[i].coords.slice(); pendingGenerated=false; autoRotate(true); showTab('setup'); }
-function useLayerAsCorridor(i){ pendingKind='corridor'; pendingGeom=importedLayers[i].coords.slice(); pendingGenerated=false; showTab('setup'); }
-function useLayerAsOrbit(i){ pendingKind='orbit'; pendingGeom=[importedLayers[i].lat, importedLayers[i].lon]; pendingGenerated=false; showTab('setup'); }
+function useLayerAsGrid(i){ pushHistory(); pendingKind='grid'; pendingGeom=importedLayers[i].coords.slice(); pendingGenerated=false; autoRotate(true); showTab('setup'); }
+function useLayerAsCorridor(i){ pushHistory(); pendingKind='corridor'; pendingGeom=importedLayers[i].coords.slice(); pendingGenerated=false; showTab('setup'); }
+function useLayerAsOrbit(i){ pushHistory(); pendingKind='orbit'; pendingGeom=[importedLayers[i].lat, importedLayers[i].lon]; pendingGenerated=false; showTab('setup'); }
 function useLayerAsWaypoints(i){
+  pushHistory();
   var coords = importedLayers[i].coords;
   waypoints = coords.map(function(c){
     return {lat:c[0], lon:c[1], alt:cfg.altitude, speed:cfg.speed, gimbal:cfg.gimbalPitch,
@@ -3653,12 +4634,9 @@ function timestampTag(){
 function buildExportFilename(wps){
   var flightSec = computeFlightSeconds(wps, cfg);
   var mins=Math.floor(flightSec/60), secs=Math.round(flightSec%60);
-  // Exact for a whole-mission export in Turn Only mode; a battery/waypoint-
-  // count-split batch falls back to counting photo:true (undercounts for a
-  // Turn Only grid/corridor batch, since those carry photo:false -- see
-  // updateStats' comment) rather than trying to apportion the dense estimate
-  // per batch. Full mode always just counts photo:true, no dense estimate
-  // involved.
+  // Exact for a whole-mission Turn Only export; a battery-split batch falls
+  // back to counting photo:true (undercounts Turn Only batches) rather than
+  // apportioning the dense estimate. Full mode always counts photo:true.
   var isDenseKind = (pendingKind==='grid' || pendingKind==='corridor') && cfg.waypointMode!=='full' && wps===waypoints;
   var photoCount = (isDenseKind ? lastEstimatedPhotos : 0) + wps.filter(w=>w.photo).length;
   return sanitizeMissionName(missionName)+'_'+timestampTag()+'_'+mins+'m'+secs+'s_'+photoCount+'p_'+droneSlug();
@@ -3681,13 +4659,10 @@ function exportWpmlSplit(){
     if(!res.ok && res.msg!=='Cancelled') alert(res.msg);
   });
 }
-// Draws a schematic route preview (not a real map screenshot — Leaflet's raster
-// tiles can't be read back into a canvas without the tile server sending
-// permissive CORS headers, and the numbered waypoint markers are HTML divIcons,
-// which no canvas-capture approach can rasterize at all). This is deliberately
-// self-contained instead: fast, no CORS dependency, and still shows the actual
-// route/waypoint count, which is the part that matters for picking a mission
-// out in DJI Fly's list.
+// A schematic preview rather than a map screenshot: Leaflet's raster tiles
+// can't be read back into a canvas without permissive CORS headers, and the
+// numbered markers are HTML divIcons no canvas capture can rasterise. Still
+// shows the route shape and waypoint count, which is what identifies a mission.
 function buildPreviewImageDataUrl(wps){
   if(!wps || !wps.length) return null;
   var W=800, H=600, pad=70;
@@ -3831,6 +4806,7 @@ function loadProject(){
     if(!res.ok){ if(res.msg!=='Cancelled') alert(res.msg); return; }
     try{
       var data = JSON.parse(res.data);
+      pushHistory();
       cfg = Object.assign({}, PRESETS.defaults, data.cfg||{});
       waypoints = data.waypoints||[];
       pois = data.pois||[];
@@ -3838,7 +4814,7 @@ function loadProject(){
       gcpPoints = data.gcpPoints||[];
       selectedWpIdx=null;
       pendingKind=null; pendingGeom=null; pendingGenerated=false;
-      redrawExclusionZones(); redrawGCPs();
+      redrawExclusionZones(); redrawGCPs(); redrawPendingBoundary();
       renderWaypoints(); renderSetup(); showTab('waypoints'); setStatus(res.msg);
     }catch(e){ alert('Invalid project file: '+e); }
   });
@@ -3853,17 +4829,35 @@ function hideProgress(){ document.getElementById('progress-overlay').classList.r
 </html>"""
 
 # ── Entry point ────────────────────────────────────────────────────────────────
-# Served from a local loopback HTTP server rather than passed as html= directly.
-# pywebview's html= loads the page via NavigateToString, which WebView2 gives a
-# null/opaque origin -- browsers only allow the Geolocation API (and other
-# secure-context-gated features) on https or on localhost/127.0.0.1, so the
-# geolocate button would fail with "Only secure origins are allowed" on every
-# launch under html=. 127.0.0.1 is specifically carved out as a "potentially
-# trustworthy origin" by browsers even over plain HTTP, so serving the exact
-# same page from there over loopback-only HTTP fixes it with no other change
-# in behavior (nothing here is reachable from outside this machine).
+# Served over loopback HTTP rather than pywebview's html=, which loads the page
+# with a null origin. Geolocation (and other secure-context features) only work
+# on https or 127.0.0.1, so html= failed with "Only secure origins are allowed".
+# Nothing here is reachable from outside this machine.
+APP_SETTINGS_PATH = os.path.join(os.path.expanduser('~'), '.drone_mission_planner.json')
+
+def _load_app_settings():
+    try:
+        with open(APP_SETTINGS_PATH, 'r', encoding='utf-8') as f:
+            s = json.load(f)
+            return s if isinstance(s, dict) else {}
+    except Exception:
+        return {}
+
+def _save_app_settings(s):
+    try:
+        with open(APP_SETTINGS_PATH, 'w', encoding='utf-8') as f:
+            json.dump(s, f, indent=2)
+    except Exception:
+        pass  # a read-only home dir shouldn't crash the app over a remembered preference
+
 class _AppRequestHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
+        if self.path not in ('/', '/index.html'):
+            # favicon.ico etc. -- a proper 404 instead of serving the whole
+            # app HTML to every stray request.
+            self.send_response(404)
+            self.end_headers()
+            return
         self.send_response(200)
         self.send_header('Content-Type', 'text/html; charset=utf-8')
         self.end_headers()
@@ -3872,24 +4866,82 @@ class _AppRequestHandler(http.server.BaseHTTPRequestHandler):
         pass  # keep the app's own console output clean
 
 def _start_local_server():
-    server = http.server.HTTPServer(('127.0.0.1', 0), _AppRequestHandler)
+    # A stable port matters: localStorage is origin-scoped and the origin is
+    # host:port, so a random port wiped the remembered drone every launch.
+    # Falls back to any free port if taken; the settings file covers that case.
+    try:
+        server = http.server.HTTPServer(('127.0.0.1', 8577), _AppRequestHandler)
+    except OSError:
+        server = http.server.HTTPServer(('127.0.0.1', 0), _AppRequestHandler)
     port = server.server_address[1]
     threading.Thread(target=server.serve_forever, daemon=True).start()
     return port
 
+def _work_area():
+    """Usable desktop rectangle (x, y, w, h) -- the screen minus the taskbar.
+
+    Returns None if it can't be determined, in which case the window falls
+    back to pywebview's own default placement.
+    """
+    if sys.platform != 'win32':
+        return None
+    try:
+        import ctypes
+        import ctypes.wintypes as wintypes
+        # Deliberately does NOT touch the process's DPI awareness: these
+        # coordinates and create_window's x/y are read in the same space either
+        # way, and declaring awareness would shrink the whole UI on a scaled
+        # display.
+        rect = wintypes.RECT()
+        SPI_GETWORKAREA = 0x0030
+        if not ctypes.windll.user32.SystemParametersInfoW(SPI_GETWORKAREA, 0, ctypes.byref(rect), 0):
+            return None
+        w, h = rect.right - rect.left, rect.bottom - rect.top
+        if w <= 0 or h <= 0:
+            return None
+        return rect.left, rect.top, w, h
+    except Exception:
+        return None
+
+
 def main():
     api = Api()
     port = _start_local_server()
+
+    # Open maximised and centred. Without explicit geometry the OS cascades
+    # the window down-and-right, so it kept starting offset to the right.
+    win_w, win_h, win_x, win_y = 1500, 900, None, None
+    area = _work_area()
+    if area:
+        ax, ay, aw, ah = area
+        win_w = max(1000, int(aw * 0.9))
+        win_h = max(650, int(ah * 0.9))
+        win_x = ax + (aw - win_w) // 2
+        win_y = ay + (ah - win_h) // 2
+
     window = webview.create_window(
-        'Drone Mission Planner',
+        f'Drone Mission Planner v{APP_VERSION}',
         url=f'http://127.0.0.1:{port}/',
         js_api=api,
-        width=1500, height=900,
+        width=win_w, height=win_h,
+        x=win_x, y=win_y,
         min_size=(1000, 650),
+        # Maximised rather than fullscreen=True: this is a planning tool, so
+        # the title bar and taskbar need to stay reachable -- fullscreen is
+        # kiosk mode and hides both.
+        maximized=True,
         background_color='#0d0d0d',
     )
     api.set_window(window)
-    webview.start(debug=False)
+    # A frozen .exe carries its icon from PyInstaller's --icon and pywebview
+    # picks that up automatically; this only covers running the script directly,
+    # which would otherwise show Python's own icon.
+    icon_path = None
+    if not getattr(sys, 'frozen', False):
+        candidate = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'icon.ico')
+        if os.path.isfile(candidate):
+            icon_path = candidate
+    webview.start(debug=False, icon=icon_path)
 
 if __name__ == '__main__':
     main()

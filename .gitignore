@@ -8,3 +8,6 @@ DroneMissionPlanner.exe
 # Third-party reference tool kept locally for research, not part of this project
 DJI-KMZ-Injector-1.0.5/
 YMapper-1.5.0/
+
+# Local MCP server state, not part of this project
+.neuralmemory/

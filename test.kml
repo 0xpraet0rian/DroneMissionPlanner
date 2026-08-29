@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8" ?>
+<kml xmlns="http://www.opengis.net/kml/2.2">
+<Document id="root_doc">
+<Schema name="acaddrawing3__entities" id="acaddrawing3__entities">
+	<SimpleField name="Layer" type="string"></SimpleField>
+	<SimpleField name="PaperSpace" type="int"></SimpleField>
+	<SimpleField name="SubClasses" type="string"></SimpleField>
+	<SimpleField name="Linetype" type="string"></SimpleField>
+	<SimpleField name="EntityHandle" type="string"></SimpleField>
+	<SimpleField name="Text" type="string"></SimpleField>
+</Schema>
+<Folder><name>acaddrawing3__entities</name>
+  <Placemark id="acaddrawing3__entities.1">
+	<Style><LineStyle><color>ff0000ff</color></LineStyle><PolyStyle><fill>0</fill></PolyStyle></Style>
+	<ExtendedData><SchemaData schemaUrl="#acaddrawing3__entities">
+		<SimpleData name="Layer">Situri</SimpleData>
+		<SimpleData name="SubClasses">AcDbEntity:AcDbPolyline</SimpleData>
+		<SimpleData name="EntityHandle">10</SimpleData>
+	</SchemaData></ExtendedData>
+      <LineString><coordinates>22.0959159558633,45.5828961790873 22.095439151241,45.5831966091091 22.095200838417,45.5833468946046 22.0949509187208,45.583152038375 22.0951883679214,45.5830010801942 22.0954262442851,45.5828504555425 22.0956574159001,45.5827048392735 22.0966159422869,45.5821057450148 22.0968614006213,45.5822991649778 22.0959159558633,45.5828961790873</coordinates></LineString>
+  </Placemark>
+</Folder>
+</Document></kml>

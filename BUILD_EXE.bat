@@ -1,9 +1,11 @@
 @echo off
 echo Building DroneMissionPlanner.exe ...
-py -m pip install --upgrade pyinstaller pywebview >nul
+py -m pip install --upgrade pyinstaller pywebview pillow >nul
+
+py gen_icon.py
 
 set ICONARG=
-if exist ico.ico set ICONARG=--icon ico.ico
+if exist icon.ico set ICONARG=--icon icon.ico
 
 py -m PyInstaller --onefile --noconsole --name DroneMissionPlanner %ICONARG% mission_planner.py
 

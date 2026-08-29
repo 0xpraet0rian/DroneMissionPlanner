@@ -1,8 +1,16 @@
-# Drone Mission Planner
+<p align="center">
+  <img src="icon.png" alt="Drone Mission Planner" width="150">
+</p>
+
+# Drone Mission Planner — v1.2
 
 A desktop tool for planning DJI waypoint missions — grid surveys, corridors, orbits,
 manual routes — that actually imports KML/KMZ properly and exports missions DJI Fly
-will load without a fight. Inspired by YMapper
+will load without a fight. Inspired by YMapper.
+
+New in v1.2: an interactive guided tutorial, place search and geolocation on the map,
+undo/redo, and a rewritten coverage engine that is exact and orientation-independent
+(see *Coverage geometry* below).
 
 
 ---
@@ -19,23 +27,54 @@ with an imported boundary instead of eyeballing it.
 DJI "auto" pattern:
 
 - **Grid survey** — draw or import a polygon, get a rotation-aware lawnmower pattern.
-  Coverage is computed with point-in-polygon sampling (not scanline edge intersection,
-  which turned out to silently drop rows of coverage at certain polygon shapes — see the
-  commit history if curious). Spacing comes from your camera's real sensor/focal geometry
+  Coverage is computed from exact scanline geometry, so rows begin and end precisely on
+  the boundary at any site orientation (see *Coverage geometry*). Spacing comes from your
+  camera's real sensor/focal geometry
   and your chosen overlap %, or you can just type an exact spacing in meters if the
   overlap-percentage math isn't how you think about it. Optional crosshatch (second pass
   at 90°) for sites where a single sweep direction leaves gaps, and an optional 3D
   mapping mode that flies the area twice — once nadir, once oblique — which is the same
   method DJI Terra and Pix4D document for actually capturing building facades instead of
   just rooftops.
-- **Corridor** — draw or import a route, get a multi-pass buffered flight path covering
-  a configurable width either side of it. Good for roads, pipelines, rail, anything
-  linear.
+- **Corridor** — draw or import a route, get a multi-pass flight path covering a
+  configurable width either side of it. Passes are true offset copies of the route with
+  mitered corners, so they stay cleanly parallel through bends instead of kinking at
+  every vertex, and the flight follows those bends rather than cutting across them. Good
+  for roads, pipelines, rail, dig transects — anything linear.
 - **Orbit** — click a center point, get a circular path at a fixed radius with the
   gimbal continuously tracking the center. Supports stacked rings at different altitudes
   for scanning a tall or complex object (tower, silo, monument) from more than one
   elevation angle, which a single ring can't do well.
 - **Manual** — click to drop waypoints one at a time, each independently editable.
+
+### Coverage geometry
+
+Rows are built from **exact scanline intersections** with the survey polygon, not by
+sampling a lattice of candidate points and testing each one. Every row therefore starts
+and ends precisely on the boundary, whatever the shape or its rotation — a sampled
+lattice left rows short by up to a full photo spacing wherever an edge wasn't parallel to
+the sweep.
+
+Coverage deliberately extends **half a line-spacing past the boundary**, evenly all the
+way round. A survey boundary marks where the site ends, not a fence the aircraft must
+stay inside of: a photo taken slightly past the edge is free extra coverage, whereas
+stopping exactly on the edge leaves it with only half a photo footprint over it. That
+margin is applied by genuinely dilating the polygon (a real mitered offset), and rows sit
+at the **centres of equal bands** rather than on the extremes of the span. Both details
+matter for rotated sites: the outermost point of a rotated shape is a corner rather than
+an edge, and a row placed exactly there catches a zero-width slice and emits a stray
+waypoint outside the area. Regression-tested at twenty orientations of the same site —
+identical waypoint count, identical row count, no stray rows, and overshoot never
+exceeding the margin.
+
+**Auto-rotation** picks the sweep angle by estimated flight *time* (using the same
+acceleration model as the rest of the app), not by bounding-box area. For a rectangle,
+sweeping along the long edge and along the short edge produce identical bounding areas,
+so an area-based choice is a coin flip that can land on many short passes instead of a
+few long ones.
+
+The live estimate runs this same geometry client-side, so its photo count, row count and
+segment count match the generator exactly rather than approximating it.
 
 ### How grid/corridor missions actually fly (and why)
 
@@ -143,7 +182,13 @@ what actually produces a circular flight path. Both are overridable per mission 
 
 **No-fly / exclusion zones.** Draw a hole (a building, a hazard, restricted airspace)
 and grid, corridor, and overview-lap coverage all skip it instead of flying straight over
-it — crosshatch and 3D-mapping included. Nothing gets left out silently: if a zone would
+it — crosshatch and 3D-mapping included. Rows are cut at the zone's exact boundary (any
+zone width, however narrow), the remaining stretches are grouped into connected cells so
+the aircraft finishes one side before starting the other, and the finished path is
+**routed around** each zone. That last step matters: splitting rows keeps photos out of a
+zone but says nothing about the straight legs *between* stretches, which is where a path
+otherwise crosses one. Verified across sixteen area/zone layouts in both waypoint modes
+with zero crossings. Nothing gets left out silently: if a zone would
 actually remove waypoints from the mission you're generating, you're asked first, with a
 count, and can choose to ignore the zone for that mission instead. A manually-placed
 waypoint (Manual mode) inside a zone gets a warning instead — you clicked there on
@@ -152,11 +197,14 @@ it runs the same coverage math client-side, not an approximation, same as the re
 estimate. (Orbit missions aren't affected — a fixed-radius circle around a point isn't an
 area-coverage sweep, so there's nothing for a zone to filter there.)
 
-**Ground control points.** Drop reference markers at known coordinates directly on the
-map — click to rename, click the &times; to remove — and export them as a plain
-`Label,Latitude,Longitude` CSV, the format Pix4D/Metashape/WebODM all import directly for
-correcting the orthomosaic afterward. They're never written into the flight-path export;
-DJI Fly would try to fly to them if they were.
+**Ground control points.** Drop reference markers on the map where you plan to place a
+physical target, then — after the flight, once you've measured each one properly with RTK
+GPS or a total station — enter its real latitude, longitude and **elevation**, tick
+*Surveyed*, and export a `Label,Latitude,Longitude,Elevation,Surveyed,Notes` CSV.
+Elevation is a required field for Pix4D/Metashape/WebODM alike: georeferencing needs
+X/Y/Z, not just X/Y. Only a surveyed GCP is worth feeding to them; an unsurveyed one is a
+planning placeholder. GCPs are never written into the flight-path export; DJI Fly would
+try to fly to them if they were.
 
 **Terrain-following altitude.** One button (in the Waypoints tab, after generating a
 mission) looks up ground elevation under every waypoint from a free SRTM-derived
@@ -169,12 +217,35 @@ third-party planners like Litchi and Maven use to get terrain-following on consu
 drones. Needs internet access; SRTM data is ~30m resolution, so it's a real help on
 hillsides, not a substitute for caution near sharp terrain features.
 
-**Map layers** — Street, Satellite, Satellite with labels, Topographic, Dark, switchable
-from a layer control, with imported layers, the flight path, exclusion zones, and ground
-control points all as separate toggleable overlays.
+**Map layers** — Street, Satellite (Esri *and* Google, each with or without labels),
+Topographic and Dark, switchable from a layer control, with imported layers, the flight
+path, exclusion zones and ground control points as separate toggleable overlays.
+Satellite resolution varies by region, so it's worth trying both providers over your
+site. The Google layer uses their unofficial tile endpoint — no key, no SLA, outside
+their terms of service, and it can be rate-limited or blocked without notice; it's the
+same approach most hobby GIS and drone-planning tools take, and Esri is there as the
+properly-licensed option.
+
+**Find your site** — search any place or address from the map (free OpenStreetMap
+geocoder, no API key), or jump straight to your current location.
 
 **Mission replay** — play/pause/scrub through the generated mission on the map with a
 moving marker, so you can sanity-check the flight path before you ever fly it.
+
+**Interactive tutorial.** A fourteen-step guided tour that dims the app and spotlights
+each part in turn — mission types, drawing gestures, search, basemaps, KML import, no-fly
+zones and GCPs, flight parameters, the tabs, live stats, export and upload, and a
+pre-flight checklist. It's offered once on first launch and replayable any time from the
+**Tutorial** button in the title bar.
+
+**Undo / redo** — `Ctrl+Z` / `Ctrl+Y` (or the toolbar buttons) across drawing, generating,
+imports, deletions and project loads.
+
+**Drawing** — click to place, **right-click** (or Backspace) to undo the last point,
+**double-click** or Enter to finish, Esc to cancel. The banner shows the traced perimeter
+or length live as you go, and clicks snap onto imported KML/KMZ geometry. A drawn
+boundary stays visible on the map after you finish it, as a reference against the
+generated flight path.
 
 **Export.** Every export is auto-named `{mission name}_{flight time}_{photo count}p_
 {drone}.kmz` — you're prompted for the mission name at the start of each one, and can
@@ -211,10 +282,11 @@ shows up in the same folder afterward — no Python needed to run it from there.
 
 ## Usage
 
-The first time you open the app it asks which drone you fly — sets the right camera and
-battery defaults from that, remembers it for next time, and it stays editable later under
-Setup → Aircraft & camera (moved down near Safety & mission behaviour, since you'll rarely
-touch it again after the first run).
+The app opens maximised and centred. The first time you run it, it asks which drone you
+fly — sets the right camera and battery defaults from that, remembers it for next time
+(in a small settings file in your home directory, so it survives updates), and it stays
+editable later under Setup → Aircraft & camera. You'll also be offered the guided tour on
+that first run.
 
 1. Import a KML/KMZ, or draw an area/route/orbit center directly on the map.
 2. Pick altitude, overlap, and (for grid missions) what you're actually trying to
@@ -291,7 +363,9 @@ overriding for your specific hardware/firmware combination.
 
 ```
 drone mission planner/
-├── mission_planner.py   # the whole app
+├── mission_planner.py    # the whole app
+├── gen_icon.py           # rebuilds icon.ico from icon.png (run by the build script)
+├── icon.png / icon.ico   # application icon
 ├── BUILD_EXE.bat         # Windows EXE builder
 ├── LICENSE
 └── README.md
