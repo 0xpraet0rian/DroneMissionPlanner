@@ -27,7 +27,7 @@ import http.server
 import xml.etree.ElementTree as ET
 import webview
 
-APP_VERSION = '1.2'
+APP_VERSION = '1.3'
 
 # ── Geo helpers ─────────────────────────────────────────────────────────────
 
@@ -126,6 +126,62 @@ def recommended_shutter_speed(altitude_m, sensor_w_mm, focal_mm, img_w_px, speed
                 1/10, 1/8, 1/6.25, 1/5, 1/4, 1/3, 1/2]
     closest = min(standard, key=lambda s: abs(ideal - s))
     return round(1 / closest)
+
+# Wind levels the forecast model publishes. A survey at 20-120 m sits between
+# these, so the closest one is used and named in the result rather than silently
+# passing off 10 m ground wind as flight-altitude wind -- the two can differ by
+# tens of degrees in direction alone.
+WIND_LEVELS_M = (10, 80, 120, 180)
+
+def _nearest_wind_level(altitude_m):
+    return min(WIND_LEVELS_M, key=lambda lv: abs(lv - (altitude_m or 0)))
+
+def fetch_wind_forecast(lat, lon, date_iso, altitude_m=80):
+    """Hourly wind for one date at a location, from Open-Meteo -- free, no API
+    key, CC-BY 4.0. Returns speeds in m/s (the unit DJI quotes wind resistance
+    in) at whichever published level is closest to the planned altitude.
+
+    Raises on any failure so the caller can show a real error rather than
+    treating a network problem as calm weather."""
+    level = _nearest_wind_level(altitude_m)
+    fields = ['wind_speed_%dm' % level, 'wind_direction_%dm' % level, 'wind_gusts_10m']
+    url = ('https://api.open-meteo.com/v1/forecast'
+           '?latitude=%.5f&longitude=%.5f'
+           '&hourly=%s&wind_speed_unit=ms&timezone=auto'
+           '&start_date=%s&end_date=%s') % (lat, lon, ','.join(fields), date_iso, date_iso)
+    try:
+        with urllib.request.urlopen(url, timeout=20) as resp:
+            data = json.loads(resp.read().decode('utf-8'))
+    except urllib.error.HTTPError as e:
+        # The API answers an out-of-range date with a bare 400, which on its own
+        # tells the user nothing -- its body carries the real reason.
+        try:
+            reason = json.loads(e.read().decode('utf-8')).get('reason')
+        except Exception:
+            reason = None
+        raise RuntimeError(reason or ('Weather lookup failed (HTTP %s). Dates must be '
+                                       'within the forecast range: today to about 16 '
+                                       'days ahead.' % e.code))
+    if 'hourly' not in data:
+        raise RuntimeError(data.get('reason') or 'Weather lookup failed')
+    h = data['hourly']
+    times = h.get('time') or []
+    speed = h.get('wind_speed_%dm' % level) or []
+    direc = h.get('wind_direction_%dm' % level) or []
+    gusts = h.get('wind_gusts_10m') or []
+    hours = []
+    for i, t in enumerate(times):
+        sp = speed[i] if i < len(speed) else None
+        dr = direc[i] if i < len(direc) else None
+        if sp is None or dr is None:
+            continue
+        hours.append({'time': t, 'hour': int(t[11:13]), 'speed': sp, 'dir': dr,
+                      'gust': gusts[i] if i < len(gusts) else None})
+    if not hours:
+        raise RuntimeError('No forecast returned for that date -- it may be outside '
+                            'the 16-day forecast range.')
+    return {'level': level, 'timezone': data.get('timezone'),
+            'elevation': data.get('elevation'), 'hours': hours}
 
 def polygon_area_m2(polygon_latlon):
     """Shoelace formula in local meters (same approach YMapper uses for its Area stat)."""
@@ -308,24 +364,24 @@ GIMBAL_PRESETS = {
 # Rated minutes are manufacturer lab-ideal figures (windless, sea level). See the
 # realistic/reserve factors below for how these become a safe per-battery budget.
 DRONE_PRESETS = {
-    'mini4pro': {'label': 'DJI Mini 4 Pro', 'droneEnumValue': 68, 'droneSubEnumValue': 0,
+    'mini4pro': {'label': 'DJI Mini 4 Pro', 'droneEnumValue': 68, 'droneSubEnumValue': 0, 'maxWindMs': 10.7,
                  'defaultCamera': 'mini4pro_48',
                  'batteries': [{'label': 'Standard (2590mAh, 34 min rated)', 'minutes': 34},
                                {'label': 'Intelligent Flight Battery Plus (45 min rated, >249g takeoff weight)', 'minutes': 45}]},
-    'mini5pro': {'label': 'DJI Mini 5 Pro', 'droneEnumValue': 68, 'droneSubEnumValue': 0,
+    'mini5pro': {'label': 'DJI Mini 5 Pro', 'droneEnumValue': 68, 'droneSubEnumValue': 0, 'maxWindMs': 12.0,
                  'defaultCamera': 'mini5pro_48',
                  'batteries': [{'label': 'Standard (36 min rated)', 'minutes': 36},
                                {'label': 'Intelligent Flight Battery Plus (4680mAh, 52 min rated)', 'minutes': 52}]},
-    'air3': {'label': 'DJI Air 3', 'droneEnumValue': 68, 'droneSubEnumValue': 0,
+    'air3': {'label': 'DJI Air 3', 'droneEnumValue': 68, 'droneSubEnumValue': 0, 'maxWindMs': 12.0,
              'defaultCamera': 'air3_50',
              'batteries': [{'label': 'Standard (46 min rated)', 'minutes': 46}]},
-    'air3s': {'label': 'DJI Air 3S', 'droneEnumValue': 68, 'droneSubEnumValue': 0,
+    'air3s': {'label': 'DJI Air 3S', 'droneEnumValue': 68, 'droneSubEnumValue': 0, 'maxWindMs': 12.0,
               'defaultCamera': 'air3s_48',
               'batteries': [{'label': 'Standard (45 min rated)', 'minutes': 45}]},
-    'mavic3': {'label': 'DJI Mavic 3', 'droneEnumValue': 68, 'droneSubEnumValue': 0,
+    'mavic3': {'label': 'DJI Mavic 3', 'droneEnumValue': 68, 'droneSubEnumValue': 0, 'maxWindMs': 12.0,
                'defaultCamera': 'mavic3e',
                'batteries': [{'label': 'Standard (46 min rated)', 'minutes': 46}]},
-    'mavic3pro': {'label': 'DJI Mavic 3 Pro', 'droneEnumValue': 68, 'droneSubEnumValue': 0,
+    'mavic3pro': {'label': 'DJI Mavic 3 Pro', 'droneEnumValue': 68, 'droneSubEnumValue': 0, 'maxWindMs': 12.0,
                   'defaultCamera': 'mavic3e',
                   'batteries': [{'label': 'Standard (43 min rated)', 'minutes': 43}]},
     'custom': {'label': 'Custom / Advanced', 'droneEnumValue': 68, 'droneSubEnumValue': 0,
@@ -588,6 +644,32 @@ def _sweep_coverage_rows(rpts, side_spacing, forward_spacing, exclude_polys=None
             rows.append(segments)
         reverse = not reverse
     return rows
+
+def _lock_headings(waypoints):
+    """Command each waypoint's aircraft heading explicitly instead of leaving it
+    to followWayline.
+
+    followWayline slaves airframe yaw to the course vector. That is fine while
+    the aircraft is moving, but a Full-mode waypoint stops dead and then holds
+    for the configured delay, and a stationary aircraft's course vector is
+    defined by nothing but GPS noise and wind drift -- which the aircraft then
+    dutifully turns to face, and turns back from once it accelerates again.
+    smoothTransition with an absolute angle gives the flight controller a
+    heading to hold through the stop, so there is nothing to chase.
+
+    The commanded angle is the bearing of the leg the aircraft is about to fly,
+    so the nominal attitude is unchanged from followWayline -- only its stability
+    while stopped. The final waypoint keeps the last leg's bearing.
+    """
+    if len(waypoints) < 2:
+        return waypoints
+    for i, wp in enumerate(waypoints):
+        j = min(i, len(waypoints) - 2)
+        a, b = waypoints[j], waypoints[j + 1]
+        brg = bearing_deg(a['lat'], a['lon'], b['lat'], b['lon'])
+        wp['heading_mode'] = 'smoothTransition'
+        wp['heading_angle'] = round(brg - 360 if brg > 180 else brg)
+    return waypoints
 
 def _decompose_into_cells(rows):
     """Boustrophedon CELLULAR decomposition.
@@ -1072,7 +1154,7 @@ def generate_grid(polygon_latlon, cfg, exclusions_latlon=None):
                                # shooting -- and doesn't pause either.
                                'photo': not is_detour,
                                'hover': 0 if is_detour else cfg.get('delayAtWaypoint', 0)})
-        return waypoints
+        return _lock_headings(waypoints)
 
     # "Turn only" (default): a stop at every photo caused position-hold jitter
     # and RC2 mission-count instability in flight testing, and consumer DJI Fly
@@ -1219,7 +1301,7 @@ def generate_corridor(line_latlon, cfg, exclusions_latlon=None):
                                'gimbal': cfg.get('gimbalPitch', -90), 'heading_mode': 'followWayline',
                                'photo': not is_detour,
                                'hover': 0 if is_detour else cfg.get('delayAtWaypoint', 0)})
-        return waypoints
+        return _lock_headings(waypoints)
 
     # Same reasoning as generate_grid: each pass flies as one continuous line
     # at a speed derived from the camera's interval timer, rather than stopping
@@ -1498,16 +1580,30 @@ def _esc(s):
 def _action_group_xml(wp, idx):
     actions = []
     aid = 0
-    # Gimbal is set once via an action (not a per-placemark angle tag) and stays at
-    # that pitch until changed again — the caller only passes a gimbal value here
-    # when it actually changes from the previous waypoint (see build_waylines_wpml).
+    # Gimbal is set once via an action and stays at that pitch until changed again --
+    # the caller only passes a gimbal value here when it actually changes from the
+    # previous waypoint (see build_waylines_wpml). gimbalRotate rather than
+    # gimbalEvenlyRotate: the latter is only legal under a betweenAdjacentPoints
+    # trigger, and it carries no yaw fields at all, leaving the gimbal's yaw target
+    # unspecified. On an aircraft whose gimbal has no independent yaw axis that
+    # resolves into an airframe rotation. gimbalYawRotateEnable=0 pins it.
+    # Matches the action DJI Fly itself emits.
     if wp.get('_gimbal_change') is not None:
         actions.append(f'''
           <wpml:action>
             <wpml:actionId>{aid}</wpml:actionId>
-            <wpml:actionActuatorFunc>gimbalEvenlyRotate</wpml:actionActuatorFunc>
+            <wpml:actionActuatorFunc>gimbalRotate</wpml:actionActuatorFunc>
             <wpml:actionActuatorFuncParam>
+              <wpml:gimbalHeadingYawBase>aircraft</wpml:gimbalHeadingYawBase>
+              <wpml:gimbalRotateMode>absoluteAngle</wpml:gimbalRotateMode>
+              <wpml:gimbalPitchRotateEnable>1</wpml:gimbalPitchRotateEnable>
               <wpml:gimbalPitchRotateAngle>{wp['_gimbal_change']}</wpml:gimbalPitchRotateAngle>
+              <wpml:gimbalRollRotateEnable>0</wpml:gimbalRollRotateEnable>
+              <wpml:gimbalRollRotateAngle>0</wpml:gimbalRollRotateAngle>
+              <wpml:gimbalYawRotateEnable>0</wpml:gimbalYawRotateEnable>
+              <wpml:gimbalYawRotateAngle>0</wpml:gimbalYawRotateAngle>
+              <wpml:gimbalRotateTimeEnable>0</wpml:gimbalRotateTimeEnable>
+              <wpml:gimbalRotateTime>0</wpml:gimbalRotateTime>
               <wpml:payloadPositionIndex>0</wpml:payloadPositionIndex>
             </wpml:actionActuatorFuncParam>
           </wpml:action>''')
@@ -1560,10 +1656,51 @@ def _mission_config_xml(cfg):
     </wpml:droneInfo>
   </wpml:missionConfig>'''
 
-def build_template_kml(cfg):
-    # DJI Fly reads waylines.wpml directly — template.kml just needs to exist
-    # alongside it with the mission config, no duplicate placemark list needed.
+def build_template_kml(cfg, waypoints=None):
+    """The editable mission, as DJI Fly reconstructs it on import.
+
+    This used to carry nothing but missionConfig, on the assumption that Fly
+    executes waylines.wpml and only needs the template to exist. That is wrong:
+    Fly builds the mission it shows (and flies) from this file, so any setting
+    missing here falls back to a Fly default no matter what waylines.wpml says.
+    A missing globalWaypointTurnMode is why "Stop at each point" did not stop --
+    the aircraft flew Fly's default pass-through turn instead.
+
+    Every global below therefore has to mirror what build_waylines_wpml emits.
+    """
     now = int(time.time() * 1000)
+    turn_mode = cfg['turnMode']
+    placemarks = []
+    for i, wp in enumerate(waypoints or []):
+        heading_mode = wp.get('heading_mode', cfg['headingMode'])
+        heading_angle = wp.get('heading_angle', 0)
+        heading_angle_enable = 1 if heading_mode in ('smoothTransition', 'towardPOI') else 0
+        placemarks.append(f'''
+    <Placemark>
+      <Point>
+        <coordinates>{wp['lon']},{wp['lat']}</coordinates>
+      </Point>
+      <wpml:index>{i}</wpml:index>
+      <wpml:executeHeight>{wp['alt']}</wpml:executeHeight>
+      <wpml:waypointSpeed>{wp.get('speed', cfg['speed'])}</wpml:waypointSpeed>
+      <wpml:waypointHeadingParam>
+        <wpml:waypointHeadingMode>{heading_mode}</wpml:waypointHeadingMode>
+        <wpml:waypointHeadingAngle>{heading_angle}</wpml:waypointHeadingAngle>
+        <wpml:waypointPoiPoint>0.000000,0.000000,0.000000</wpml:waypointPoiPoint>
+        <wpml:waypointHeadingAngleEnable>{heading_angle_enable}</wpml:waypointHeadingAngleEnable>
+        <wpml:waypointHeadingPathMode>followBadArc</wpml:waypointHeadingPathMode>
+        <wpml:waypointHeadingPoiIndex>0</wpml:waypointHeadingPoiIndex>
+      </wpml:waypointHeadingParam>
+      <wpml:waypointTurnParam>
+        <wpml:waypointTurnMode>{wp.get('turn_mode', turn_mode)}</wpml:waypointTurnMode>
+        <wpml:waypointTurnDampingDist>0</wpml:waypointTurnDampingDist>
+      </wpml:waypointTurnParam>
+      <wpml:useStraightLine>1</wpml:useStraightLine>
+      <wpml:useGlobalHeight>0</wpml:useGlobalHeight>
+      <wpml:useGlobalSpeed>0</wpml:useGlobalSpeed>
+      <wpml:useGlobalHeadingParam>0</wpml:useGlobalHeadingParam>
+      <wpml:useGlobalTurnParam>0</wpml:useGlobalTurnParam>
+    </Placemark>''')
     return f'''<?xml version="1.0" encoding="UTF-8"?>
 <kml xmlns="http://www.opengis.net/kml/2.2" xmlns:wpml="http://www.dji.com/wpmz/1.0.2">
 <Document>
@@ -1571,6 +1708,18 @@ def build_template_kml(cfg):
   <wpml:createTime>{now}</wpml:createTime>
   <wpml:updateTime>{now}</wpml:updateTime>
 {_mission_config_xml(cfg)}
+  <Folder>
+    <wpml:templateType>waypoint</wpml:templateType>
+    <wpml:templateId>0</wpml:templateId>
+    <wpml:waylineCoordinateSysParam>
+      <wpml:coordinateMode>WGS84</wpml:coordinateMode>
+      <wpml:heightMode>{cfg['heightMode']}</wpml:heightMode>
+    </wpml:waylineCoordinateSysParam>
+    <wpml:autoFlightSpeed>{cfg['speed']}</wpml:autoFlightSpeed>
+    <wpml:gimbalPitchMode>usePointSetting</wpml:gimbalPitchMode>
+    <wpml:globalWaypointTurnMode>{turn_mode}</wpml:globalWaypointTurnMode>
+    <wpml:globalUseStraightLine>1</wpml:globalUseStraightLine>{''.join(placemarks)}
+  </Folder>
 </Document>
 </kml>'''
 
@@ -1586,9 +1735,8 @@ def build_waylines_wpml(cfg, waypoints):
         ag = _action_group_xml(wp2, i)
         heading_mode = wp.get('heading_mode', cfg['headingMode'])
         heading_angle = wp.get('heading_angle', 0)
-        # Absent from DJI's documented WPML spec and from real production
-        # files, so likely inert -- but an independent WPML library pairs
-        # smoothTransition with 1, and matching that costs nothing.
+        # DJI Fly's own exports and Maven Route both set this to 1 whenever a
+        # heading angle is meant to be honoured, so it is not inert.
         heading_angle_enable = 1 if heading_mode in ('smoothTransition', 'towardPOI') else 0
         placemarks.append(f'''
       <Placemark>
@@ -1604,12 +1752,17 @@ def build_waylines_wpml(cfg, waypoints):
           <wpml:waypointPoiPoint>0.000000,0.000000,0.000000</wpml:waypointPoiPoint>
           <wpml:waypointHeadingAngleEnable>{heading_angle_enable}</wpml:waypointHeadingAngleEnable>
           <wpml:waypointHeadingPathMode>followBadArc</wpml:waypointHeadingPathMode>
+          <wpml:waypointHeadingPoiIndex>0</wpml:waypointHeadingPoiIndex>
         </wpml:waypointHeadingParam>
         <wpml:waypointTurnParam>
           <wpml:waypointTurnMode>{wp.get('turn_mode', cfg['turnMode'])}</wpml:waypointTurnMode>
           <wpml:waypointTurnDampingDist>0</wpml:waypointTurnDampingDist>
         </wpml:waypointTurnParam>
         <wpml:useStraightLine>1</wpml:useStraightLine>{ag}
+        <wpml:waypointGimbalHeadingParam>
+          <wpml:waypointGimbalPitchAngle>{gimbal}</wpml:waypointGimbalPitchAngle>
+          <wpml:waypointGimbalYawAngle>0</wpml:waypointGimbalYawAngle>
+        </wpml:waypointGimbalHeadingParam>
       </Placemark>''')
     return f'''<?xml version="1.0" encoding="UTF-8"?>
 <kml xmlns="http://www.opengis.net/kml/2.2" xmlns:wpml="http://www.dji.com/wpmz/1.0.2">
@@ -1627,7 +1780,7 @@ def build_waylines_wpml(cfg, waypoints):
 </kml>'''
 
 def export_wpml_kmz(cfg, waypoints, out_path):
-    tkml = build_template_kml(cfg)
+    tkml = build_template_kml(cfg, waypoints)
     wpml = build_waylines_wpml(cfg, waypoints)
     with zipfile.ZipFile(out_path, 'w', zipfile.ZIP_DEFLATED) as z:
         z.writestr('wpmz/template.kml', tkml)
@@ -1922,6 +2075,12 @@ class Api:
     # restarts here: the page's origin includes the local server's port, and
     # an origin change silently wipes localStorage. Used for the remembered
     # drone model and the first-run tutorial flag.
+    def wind_forecast(self, lat, lon, date_iso, altitude_m=80):
+        try:
+            return {'ok': True, **fetch_wind_forecast(lat, lon, date_iso, altitude_m)}
+        except Exception as e:
+            return {'ok': False, 'msg': str(e)}
+
     def get_app_settings(self):
         return {'ok': True, 'settings': _load_app_settings()}
 
@@ -2335,6 +2494,19 @@ button:disabled{opacity:.35;cursor:default;}
   border-radius:50%;background:var(--bg4);color:var(--text-faint);font-size:9px;font-weight:700;
   cursor:help;margin-left:5px;vertical-align:middle;border:1px solid var(--border2);flex-shrink:0;}
 .help-icon:hover{background:var(--orange-dim);color:#fff;border-color:var(--orange);}
+
+/* ── Flight weather ── */
+#wx-result{margin-top:9px;}
+.wx-headline{font-size:15px;font-weight:700;margin:2px 0 6px;}
+.wx-good{color:var(--green);} .wx-warn{color:var(--orange2);} .wx-bad{color:var(--red);}
+.wx-strip{display:flex;gap:1px;margin:8px 0 4px;height:34px;align-items:flex-end;}
+.wx-strip div{flex:1;border-radius:1px 1px 0 0;min-height:2px;position:relative;}
+.wx-axis{display:flex;justify-content:space-between;font-size:8.5px;color:var(--text-faint);
+  margin-bottom:7px;}
+.wx-tips{margin-top:8px;padding-left:15px;font-size:10.5px;color:var(--text-dim);line-height:1.6;}
+.wx-tips li{margin-bottom:4px;}
+.wx-tips b{color:var(--text);}
+.wx-meta{font-size:9.5px;color:var(--text-faint);margin-top:7px;line-height:1.5;}
 
 /* ── Collapsible groups ── */
 details{border:1px solid var(--border);border-radius:var(--radius-sm);margin-bottom:8px;
@@ -3496,6 +3668,16 @@ function renderSetup(){
     '<div class="field"><label>Delay at each waypoint (sec, 0=none)'+help('Only applies to Orbit, Manual, and the Overview lap -- those still take one discrete photo per waypoint, and the aircraft moves on once it considers that action done, which in real-world reports is roughly "shutter fired," not "confirmed written to the card." On a slow card, or shooting RAW/DNG, that can mean a skipped photo the mission never notices; 1-2s is usually enough for JPEG on a fast card, several seconds for RAW on a slow one. Grid/corridor missions don\'t stop per shot at all now (see Camera interval under Advanced), so this has no effect on those.')+'</label><input type="number" min="0" value="'+cfg.delayAtWaypoint+'" onchange="cfg.delayAtWaypoint=parseFloat(this.value)||0"></div>' +
     '</div>' +
 
+    // ── Flight weather — wind is the condition that actually decides a survey ──
+    '<div class="panel-section" id="sec-weather"><h4>Flight weather</h4>' +
+    '<div class="field-row">' +
+      '<div class="field"><label>Flight date</label><input type="date" id="wx-date" value="'+wxDefaultDate()+'" min="'+wxDefaultDate()+'" max="'+wxMaxDate()+'"></div>' +
+      '<div class="field"><label>Location'+help('Taken from the mission you are planning -- the centre of a grid area, the middle of a corridor route, or an orbit centre. Falls back to the middle of the current map view if no mission is set yet.')+'</label><input type="text" id="wx-loc" value="'+wxLocationLabel()+'" readonly></div>' +
+    '</div>' +
+    '<button style="width:100%;" onclick="fetchWeather()" title="Looks up hourly wind for that date and location (Open-Meteo, free, no account needed)">&#127788; Get wind forecast</button>' +
+    '<div id="wx-result"></div>' +
+    '</div>' +
+
     // ── Battery & endurance — drives automatic mission splitting ──
     '<div class="panel-section"><h4>Battery &amp; endurance</h4>' +
     '<div class="field"><label>Battery</label><select onchange="setBattery(this.value)">'+batteryOptions()+'</select></div>' +
@@ -3695,6 +3877,153 @@ function usableBatteryMinutes(c){
   var reserve=c.reserveFraction!=null?c.reserveFraction:0.30;
   return Math.max(1, (c.batteryMinutes||20) * realistic * (1-reserve));
 }
+// ── Flight weather ──────────────────────────────────────────────────────────
+// Wind is the condition that actually decides whether a survey is worth flying,
+// so this pulls a real hourly forecast rather than leaving the wind field as a
+// number you're expected to already know. Open-Meteo: free, no API key, CC-BY.
+function wxDefaultDate(){
+  var d = new Date(), off = d.getTimezoneOffset();
+  return new Date(d.getTime() - off*60000).toISOString().slice(0,10);
+}
+function wxMaxDate(){
+  // Open-Meteo publishes 16 days of forecast; past that there is nothing to ask for.
+  var d = new Date(Date.now() + 15*86400000), off = d.getTimezoneOffset();
+  return new Date(d.getTime() - off*60000).toISOString().slice(0,10);
+}
+// The mission's own location, so the forecast is for where you'll actually fly
+// rather than wherever the map happens to be scrolled.
+function missionCenter(){
+  if(pendingKind==='orbit' && pendingGeom) return [pendingGeom[0], pendingGeom[1]];
+  if(pendingGeom && pendingGeom.length){
+    var la=0, lo=0;
+    pendingGeom.forEach(function(p){ la+=p[0]; lo+=p[1]; });
+    return [la/pendingGeom.length, lo/pendingGeom.length];
+  }
+  if(waypoints.length){
+    var a=0,b=0;
+    waypoints.forEach(function(w){ a+=w.lat; b+=w.lon; });
+    return [a/waypoints.length, b/waypoints.length];
+  }
+  var c = map.getCenter();
+  return [c.lat, c.lng];
+}
+function wxLocationLabel(){
+  var c = missionCenter();
+  return c[0].toFixed(4)+', '+c[1].toFixed(4);
+}
+var wxLast = null;
+function fetchWeather(){
+  var date = document.getElementById('wx-date').value || wxDefaultDate();
+  var c = missionCenter();
+  var el = document.getElementById('wx-result');
+  el.innerHTML = '<div class="hint">Fetching forecast…</div>';
+  pywebview.api.wind_forecast(c[0], c[1], date, cfg.altitude||80).then(function(r){
+    if(!r.ok){ el.innerHTML = '<div class="hint warn">Forecast failed: '+r.msg+'</div>'; return; }
+    wxLast = r; wxLast.date = date;
+    renderWeather(r, date);
+  });
+}
+// Circular mean -- averaging bearings arithmetically is wrong across the 360/0
+// wrap (350 deg and 10 deg average to 180, the exact opposite of the truth).
+function meanBearing(degs){
+  var x=0, y=0;
+  degs.forEach(function(d){ var r=d*Math.PI/180; x+=Math.cos(r); y+=Math.sin(r); });
+  if(!degs.length) return 0;
+  var m = Math.atan2(y/degs.length, x/degs.length)*180/Math.PI;
+  return (m+360)%360;
+}
+function compass(deg){
+  var pts=['N','NNE','NE','ENE','E','ESE','SE','SSE','S','SSW','SW','WSW','W','WNW','NW','NNW'];
+  return pts[Math.round(((deg%360)/22.5))%16];
+}
+function renderWeather(r, date){
+  var el = document.getElementById('wx-result');
+  // Daylight hours only: the rest of the day is noise for a survey you have to
+  // see the aircraft during.
+  var hrs = r.hours.filter(function(h){ return h.hour>=6 && h.hour<=20; });
+  if(!hrs.length) hrs = r.hours;
+  var speeds = hrs.map(function(h){ return h.speed; });
+  var gusts = hrs.map(function(h){ return h.gust; }).filter(function(g){ return g!=null; });
+  var maxS = Math.max.apply(null, speeds), minS = Math.min.apply(null, speeds);
+  var peakG = gusts.length ? Math.max.apply(null, gusts) : null;
+  var dirMean = meanBearing(hrs.map(function(h){ return h.dir; }));
+
+  var drone = PRESETS.drones[cfg.drone] || {};
+  var limit = drone.maxWindMs || null;
+
+  // Calmest three-hour window -- what you'd actually plan the flight around.
+  var best=null;
+  for(var i=0;i+2<hrs.length;i++){
+    var w = Math.max(hrs[i].speed, hrs[i+1].speed, hrs[i+2].speed);
+    if(!best || w < best.w) best = {w:w, i:i};
+  }
+
+  // Verdict thresholds: the drone's own rating first, then the tighter limit
+  // mapping quality imposes well below it.
+  var verdict, cls;
+  if(limit && maxS >= limit){ verdict='Do not fly'; cls='wx-bad'; }
+  else if(limit && maxS >= limit*0.7){ verdict='Marginal'; cls='wx-warn'; }
+  else if(maxS > 8){ verdict='Flyable, poor for mapping'; cls='wx-warn'; }
+  else if(maxS > 5){ verdict='Usable'; cls='wx-warn'; }
+  else { verdict='Good'; cls='wx-good'; }
+
+  var barMax = Math.max(maxS, peakG||0, limit||8);
+  var strip = hrs.map(function(h){
+    var pct = Math.max(3, Math.round(h.speed/barMax*100));
+    var col = (limit && h.speed>=limit) ? 'var(--red)'
+            : (limit && h.speed>=limit*0.7) ? 'var(--orange2)'
+            : (h.speed>8) ? 'var(--orange-dim)' : 'var(--green)';
+    return '<div style="height:'+pct+'%;background:'+col+';" title="'+h.hour+':00 — '
+      + h.speed.toFixed(1)+' m/s from '+Math.round(h.dir)+'°'
+      + (h.gust!=null?', gust '+h.gust.toFixed(1):'')+'"></div>';
+  }).join('');
+
+  var today = wxDefaultDate();
+  var daysOut = Math.round((new Date(date) - new Date(today))/86400000);
+
+  var tips = [];
+  if(limit && maxS >= limit){
+    tips.push('Forecast wind reaches <b>'+maxS.toFixed(1)+' m/s</b>, at or past the '
+      +(drone.label||'aircraft')+"'s rated <b>"+limit+' m/s</b>. The rating is the point the aircraft can no longer hold position — not a target to fly at.');
+  } else if(limit && maxS >= limit*0.7){
+    tips.push('Peak <b>'+maxS.toFixed(1)+' m/s</b> is over 70% of the rated <b>'+limit+' m/s</b>. It will hold position, but it spends battery doing it and the margin for a gust is thin.');
+  }
+  if(peakG!=null && peakG > maxS*1.5){
+    tips.push('Gusts to <b>'+peakG.toFixed(1)+' m/s</b> against a steady '+maxS.toFixed(1)+' m/s. <b>Gusts matter more than the average</b> — they are what breaks altitude hold and puts blur in a frame.');
+  }
+  if(maxS > 8){
+    tips.push('Above about <b>8 m/s</b> mapping quality suffers before safety does: the aircraft is pushed off the planned line, so overlap gets uneven and frames blur.');
+  }
+  tips.push('A <b>tailwind</b> pushes the aircraft faster than planned, thinning forward overlap; a <b>headwind</b> slows it and stacks up redundant frames. A <b>crosswind</b> is worst — constant yaw correction misaligns images.');
+  tips.push('Wind aloft is stronger than at head height. This reading is the <b>'+r.level+' m</b> level, closest to your '+(cfg.altitude||80)+' m planning altitude.');
+  tips.push('Fly the passes <b>along</b> the wind axis, not across it — use <i>Align to wind</i> under Grid survey with the direction below.');
+  if(limit) tips.push('Budget extra battery: holding a line into wind draws well above the still-air estimate this app shows.');
+
+  el.innerHTML =
+    '<div class="wx-headline '+cls+'">'+verdict+' — '+minS.toFixed(1)+'–'+maxS.toFixed(1)+' m/s</div>' +
+    '<div class="hint">Wind from <b>'+compass(dirMean)+' ('+Math.round(dirMean)+'°)</b>'
+      + (peakG!=null?' · peak gust <b>'+peakG.toFixed(1)+' m/s</b>':'')
+      + (limit?' · '+(drone.label||'aircraft')+' rated <b>'+limit+' m/s</b>':'') + '</div>' +
+    '<div class="wx-strip">'+strip+'</div>' +
+    '<div class="wx-axis"><span>'+hrs[0].hour+':00</span><span>'+hrs[hrs.length-1].hour+':00</span></div>' +
+    (best ? '<div class="hint">Calmest window: <b>'+hrs[best.i].hour+':00–'+(hrs[best.i+2].hour+1)+':00</b> (up to '+best.w.toFixed(1)+' m/s)</div>' : '') +
+    '<button style="width:100%;margin-top:8px;" onclick="useForecastWind('+dirMean.toFixed(1)+')">&#8634; Use '+Math.round(dirMean)+'° and align the grid</button>' +
+    '<ul class="wx-tips">'+tips.map(function(t){ return '<li>'+t+'</li>'; }).join('')+'</ul>' +
+    '<div class="wx-meta">' +
+      (daysOut<=0
+        ? '&#9989; Today — nowcast plus short-range model, the most reliable this gets.'
+        : '&#9888; <b>'+daysOut+' day'+(daysOut>1?'s':'')+' ahead: this is a model estimate, not an observation.</b> Wind forecasts lose skill quickly with range — treat anything beyond a couple of days as a rough planning hint and re-check on the morning of the flight.') +
+      '<br>Weather data by <b>Open-Meteo.com</b> (CC-BY 4.0). It is a free shared service — <b>use it sparingly</b>: fetch when you actually need a figure, not repeatedly while tweaking other settings.' +
+      '<br>A forecast is never a substitute for looking at the sky and checking conditions on site before you launch.' +
+    '</div>';
+}
+function useForecastWind(deg){
+  var el = document.getElementById('wind-dir');
+  if(el) el.value = Math.round(deg);
+  if(pendingKind==='grid') rotateForWind();
+  else setStatus('Wind direction set to '+Math.round(deg)+'° — draw or pick a grid area to align it.');
+}
+
 function autoRotate(silent){
   var poly = (pendingKind==='grid') ? pendingGeom : null;
   if(!poly){ if(!silent) alert('Draw or select a grid area first, then Auto-rotate.'); return; }

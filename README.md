@@ -2,15 +2,17 @@
   <img src="icon.png" alt="Drone Mission Planner" width="150">
 </p>
 
-# Drone Mission Planner — v1.2
+# Drone Mission Planner — v1.3
 
 A desktop tool for planning DJI waypoint missions — grid surveys, corridors, orbits,
 manual routes — that actually imports KML/KMZ properly and exports missions DJI Fly
 will load without a fight. Inspired by YMapper.
 
-New in v1.2: an interactive guided tutorial, place search and geolocation on the map,
-undo/redo, and a rewritten coverage engine that is exact and orientation-independent
-(see *Coverage geometry* below).
+New in v1.3: exported missions now carry a complete `template.kml`, so DJI Fly honours
+the turn style and heading you actually chose instead of silently substituting its own
+defaults — this fixes aircraft that flew through waypoints without stopping, and the
+spurious yaw at each waypoint. Also new: a wind forecast for your flight date and
+location, with guidance on what the numbers mean for a survey.
 
 
 ---
@@ -232,6 +234,29 @@ geocoder, no API key), or jump straight to your current location.
 **Mission replay** — play/pause/scrub through the generated mission on the map with a
 moving marker, so you can sanity-check the flight path before you ever fly it.
 
+**Flight weather.** Pick a flight date and hit *Get wind forecast* — the location comes
+from the mission you're planning (grid centroid, corridor midpoint, orbit centre), so it's
+the weather where you'll actually fly. You get hourly wind for that day as a colour-coded
+strip, the calmest three-hour window, peak gusts, and a verdict measured against **your
+drone's own rated wind resistance** (10.7 m/s for the Mini 4 Pro, 12 m/s for the Mini 5
+Pro / Air 3 / Air 3S / Mavic 3 series — editable per drone). One button pushes the
+forecast direction into *Align to wind* and rotates the grid to match.
+
+Wind is read at the model level closest to your planning altitude (10, 80, 120 or 180 m)
+rather than reporting ground wind as if it were flight wind — direction alone can differ
+by tens of degrees between them. The advice is specific rather than generic: a tailwind
+thins forward overlap, a headwind stacks up redundant frames, a crosswind is worst because
+constant yaw correction misaligns images, and above roughly 8 m/s mapping quality degrades
+well before safety does. Gusts are called out separately, since they're what actually
+breaks altitude hold.
+
+Two things it tells you plainly: **anything past today is a model estimate, not an
+observation** — wind forecasts lose skill quickly with range, so treat a week out as a
+rough planning hint and re-check on the morning — and the data comes from
+[Open-Meteo](https://open-meteo.com/) (free, no account, CC-BY 4.0), a shared service, so
+**fetch sparingly** rather than on every settings tweak. A forecast is never a substitute
+for looking at the sky before you launch.
+
 **Interactive tutorial.** A fourteen-step guided tour that dims the app and spotlights
 each part in turn — mission types, drawing gestures, search, basemaps, KML import, no-fly
 zones and GCPs, flight parameters, the tabs, live stats, export and upload, and a
@@ -376,7 +401,9 @@ drone mission planner/
 Built with [pywebview](https://pywebview.flowrl.com/) (native window, embedded
 browser), [Leaflet](https://leafletjs.com/) (the map), and tiles from
 [OpenStreetMap](https://www.openstreetmap.org/), [Esri](https://www.esri.com/),
-[OpenTopoMap](https://opentopomap.org/), and [CARTO](https://carto.com/).
+[OpenTopoMap](https://opentopomap.org/), and [CARTO](https://carto.com/). Wind
+forecasts come from [Open-Meteo](https://open-meteo.com/) (CC-BY 4.0) and ground
+elevation from [Open-Topo-Data](https://www.opentopodata.org/).
 
 The DJI WPML export structure and the `droneEnumValue=68` value (undocumented for
 consumer drones anywhere official) came from studying
